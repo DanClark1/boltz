@@ -244,23 +244,40 @@ def load_model(
         "write_full_pde": kwargs.pop("write_full_pde", False),
     }
 
-    # Default diffusion parameters
-    @dataclass
-    class DiffusionParams:
-        gamma_0: float = 0.8 if model_name.lower() == "boltz2" else 0.605
-        gamma_min: float = 1.0 if model_name.lower() == "boltz2" else 1.107
-        noise_scale: float = 1.003 if model_name.lower() == "boltz2" else 0.901
-        rho: float = 7 if model_name.lower() == "boltz2" else 8
-        step_scale: float = 1.5 if model_name.lower() == "boltz2" else 1.638
-        sigma_min: float = 0.0001 if model_name.lower() == "boltz2" else 0.0004
-        sigma_max: float = 160.0
-        sigma_data: float = 16.0
-        P_mean: float = -1.2
-        P_std: float = 1.5
-        coordinate_augmentation: bool = True
-        alignment_reverse_diff: bool = True
-        synchronize_sigmas: bool = True
-        use_inference_model_cache: bool = True
+    # Default diffusion parameters - different for Boltz1 vs Boltz2
+    if model_name.lower() == "boltz2":
+        @dataclass
+        class DiffusionParams:
+            gamma_0: float = 0.8
+            gamma_min: float = 1.0
+            noise_scale: float = 1.003
+            rho: float = 7
+            step_scale: float = 1.5
+            sigma_min: float = 0.0001
+            sigma_max: float = 160.0
+            sigma_data: float = 16.0
+            P_mean: float = -1.2
+            P_std: float = 1.5
+            coordinate_augmentation: bool = True
+            alignment_reverse_diff: bool = True
+            synchronize_sigmas: bool = True
+    else:
+        @dataclass
+        class DiffusionParams:
+            gamma_0: float = 0.605
+            gamma_min: float = 1.107
+            noise_scale: float = 0.901
+            rho: float = 8
+            step_scale: float = 1.638
+            sigma_min: float = 0.0004
+            sigma_max: float = 160.0
+            sigma_data: float = 16.0
+            P_mean: float = -1.2
+            P_std: float = 1.5
+            coordinate_augmentation: bool = True
+            alignment_reverse_diff: bool = True
+            synchronize_sigmas: bool = True
+            use_inference_model_cache: bool = True
 
     @dataclass
     class PairformerArgs:
@@ -277,7 +294,7 @@ def load_model(
         msa_blocks: int = 4
         msa_dropout: float = 0.0
         z_dropout: float = 0.0
-        use_paired_feature: bool = True
+        use_paired_feature: bool = False  # Set below based on model
         pairwise_head_width: int = 32
         pairwise_num_heads: int = 4
         activation_checkpointing: bool = False
@@ -297,7 +314,7 @@ def load_model(
 
     diffusion_params = DiffusionParams()
     pairformer_args = PairformerArgs()
-    msa_args = MSAModuleArgs()
+    msa_args = MSAModuleArgs(use_paired_feature=(model_name.lower() == "boltz2"))
     steering_args = SteeringArgs()
 
     # Load model
