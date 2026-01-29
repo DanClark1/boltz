@@ -442,12 +442,7 @@ def predict(
     # Determine model type
     is_boltz2 = isinstance(model, Boltz2)
 
-    # Import required modules
-    from boltz.data.parse.yaml import parse_yaml
-    from boltz.data.parse.fasta import parse_fasta
-    from boltz.data.types import Record
-
-    # Parse input files
+    # Collect input files
     if input_path.is_dir():
         input_files = list(input_path.glob("*.yaml")) + list(input_path.glob("*.yml"))
         input_files += list(input_path.glob("*.fasta")) + list(input_path.glob("*.fa"))
@@ -457,131 +452,112 @@ def predict(
     if not input_files:
         raise ValueError(f"No input files found at {input_path}")
 
-    # Process each input and collect results
+    # Use the existing process_inputs function from main.py
+    from boltz.main import process_inputs, download_boltz1, download_boltz2
+
+    # Ensure required data is downloaded
+    if is_boltz2:
+        download_boltz2(cache)
+        ccd_path = None
+        mol_dir = cache / "mols"
+    else:
+        download_boltz1(cache)
+        ccd_path = cache / "ccd.pkl"
+        mol_dir = cache / "mols" if (cache / "mols").exists() else cache
+
+    # Process inputs using the existing infrastructure
+    process_inputs(
+        data=input_files,
+        out_dir=out_dir,
+        ccd_path=ccd_path,
+        mol_dir=mol_dir,
+        msa_server_url="https://api.colabfold.com",
+        msa_pairing_strategy="greedy",
+        use_msa_server=use_msa_server,
+        boltz2=is_boltz2,
+    )
+
+    # Load the manifest
+    manifest = Manifest.load(out_dir / "processed" / "manifest.json")
+
+    # Set up data module based on model type
+    if is_boltz2:
+        from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
+        data_module = Boltz2InferenceDataModule(
+            manifest=manifest,
+            target_dir=out_dir / "processed" / "structures",
+            msa_dir=out_dir / "processed" / "msa",
+            mol_dir=mol_dir,
+            num_workers=num_workers,
+            constraints_dir=out_dir / "processed" / "constraints",
+            template_dir=out_dir / "processed" / "templates",
+            extra_mols_dir=out_dir / "processed" / "mols",
+        )
+    else:
+        from boltz.data.module.inference import BoltzInferenceDataModule
+        data_module = BoltzInferenceDataModule(
+            manifest=manifest,
+            target_dir=out_dir / "processed" / "structures",
+            msa_dir=out_dir / "processed" / "msa",
+            num_workers=num_workers,
+            constraints_dir=out_dir / "processed" / "constraints",
+        )
+
+    # Set up data module
+    data_module.setup(stage="predict")
+    dataloader = data_module.predict_dataloader()
+
+    # Determine device
+    if device is not None:
+        model_device = torch.device(device)
+    elif next(model.parameters()).is_cuda:
+        model_device = next(model.parameters()).device
+    else:
+        model_device = torch.device("cpu")
+
+    model = model.to(model_device)
+
+    # Run inference
     all_results = []
+    with torch.no_grad():
+        for batch in dataloader:
+            # Move batch to device
+            batch = {
+                k: v.to(model_device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
-    for input_file in input_files:
-        print(f"Processing {input_file.name}...")
-
-        # Create working directories
-        targets_dir = out_dir / "processed" / "targets"
-        msa_dir = out_dir / "processed" / "msa"
-        targets_dir.mkdir(parents=True, exist_ok=True)
-        msa_dir.mkdir(parents=True, exist_ok=True)
-
-        # Parse input
-        if input_file.suffix in (".yaml", ".yml"):
-            records = parse_yaml(input_file, targets_dir, ccd=None)
-        else:
-            records = parse_fasta(input_file, targets_dir)
-
-        # Handle MSA generation if needed
-        if use_msa_server:
-            from boltz.data.msa.mmseqs2 import run_mmseqs2
-            for record in records:
-                if hasattr(record, 'sequences'):
-                    for seq in record.sequences:
-                        if hasattr(seq, 'protein') and seq.protein:
-                            msa_path = msa_dir / f"{record.id}_{seq.protein.id}.a3m"
-                            if not msa_path.exists():
-                                run_mmseqs2(
-                                    sequences=[seq.protein.sequence],
-                                    output_dir=msa_dir,
-                                    use_env=True,
-                                    use_pairing=False,
-                                )
-
-        # Set up data module based on model type
-        if is_boltz2:
-            from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
-            from boltz.data.mol import load_canonicals
-
-            mol_dir = cache / "mols"
-            if not mol_dir.exists():
-                # Download molecules if needed
-                import tarfile
-                import urllib.request
-                mol_url = "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar"
-                mol_tar = cache / "mols.tar"
-                if not mol_tar.exists():
-                    print("Downloading molecule data...")
-                    urllib.request.urlretrieve(mol_url, str(mol_tar))
-                with tarfile.open(mol_tar) as tar:
-                    tar.extractall(cache)
-
-            manifest = Manifest(records=records)
-            data_module = Boltz2InferenceDataModule(
-                manifest=manifest,
-                target_dir=targets_dir,
-                msa_dir=msa_dir,
-                mol_dir=mol_dir,
-                num_workers=num_workers,
-            )
-        else:
-            from boltz.data.module.inference import BoltzInferenceDataModule
-            manifest = Manifest(records=records)
-            data_module = BoltzInferenceDataModule(
-                manifest=manifest,
-                target_dir=targets_dir,
-                msa_dir=msa_dir,
-                num_workers=num_workers,
+            # Run forward pass - hooks will fire here
+            output = model(
+                batch,
+                recycling_steps=recycling_steps,
+                num_sampling_steps=sampling_steps,
+                diffusion_samples=diffusion_samples,
+                run_confidence_sequentially=True,
             )
 
-        # Set up data module
-        data_module.setup(stage="predict")
-        dataloader = data_module.predict_dataloader()
+            # Collect results
+            result = {
+                "coords": output["sample_atom_coords"].cpu(),
+                "s": output["s"].cpu(),
+                "z": output["z"].cpu(),
+                "pdistogram": output["pdistogram"].cpu(),
+            }
 
-        # Determine device
-        if device is not None:
-            model_device = torch.device(device)
-        elif next(model.parameters()).is_cuda:
-            model_device = next(model.parameters()).device
-        else:
-            model_device = torch.device("cpu")
+            # Add confidence outputs if available
+            if "plddt" in output:
+                result["plddt"] = output["plddt"].cpu()
+            if "pae" in output:
+                result["pae"] = output["pae"].cpu()
+            if "pde" in output:
+                result["pde"] = output["pde"].cpu()
+            if "ptm" in output:
+                result["ptm"] = output["ptm"].cpu()
+            if "iptm" in output:
+                result["iptm"] = output["iptm"].cpu()
+            if "complex_plddt" in output:
+                result["complex_plddt"] = output["complex_plddt"].cpu()
 
-        model = model.to(model_device)
-
-        # Run inference
-        with torch.no_grad():
-            for batch in dataloader:
-                # Move batch to device
-                batch = {
-                    k: v.to(model_device) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
-
-                # Run forward pass - hooks will fire here
-                output = model(
-                    batch,
-                    recycling_steps=recycling_steps,
-                    num_sampling_steps=sampling_steps,
-                    diffusion_samples=diffusion_samples,
-                    run_confidence_sequentially=True,
-                )
-
-                # Collect results
-                result = {
-                    "input_file": str(input_file),
-                    "coords": output["sample_atom_coords"].cpu(),
-                    "s": output["s"].cpu(),
-                    "z": output["z"].cpu(),
-                    "pdistogram": output["pdistogram"].cpu(),
-                }
-
-                # Add confidence outputs if available
-                if "plddt" in output:
-                    result["plddt"] = output["plddt"].cpu()
-                if "pae" in output:
-                    result["pae"] = output["pae"].cpu()
-                if "pde" in output:
-                    result["pde"] = output["pde"].cpu()
-                if "ptm" in output:
-                    result["ptm"] = output["ptm"].cpu()
-                if "iptm" in output:
-                    result["iptm"] = output["iptm"].cpu()
-                if "complex_plddt" in output:
-                    result["complex_plddt"] = output["complex_plddt"].cpu()
-
-                all_results.append(result)
+            all_results.append(result)
 
     return all_results
