@@ -74,14 +74,28 @@ try:  # noqa: SIM105
     __version__ = version("boltz")
 except PackageNotFoundError:
     # package is not installed
-    pass
+    __version__ = "unknown"
 
-# Import model classes for direct access
-from boltz.model.models.boltz1 import Boltz1
-from boltz.model.models.boltz2 import Boltz2
+# Lazy imports - these are done inside functions to avoid import errors
+# when dependencies aren't installed yet
+Boltz1 = None
+Boltz2 = None
+Manifest = None
+Record = None
 
-# Import data types that users may need
-from boltz.data.types import Manifest, Record
+
+def _ensure_imports():
+    """Lazily import model classes when first needed."""
+    global Boltz1, Boltz2, Manifest, Record
+    if Boltz1 is None:
+        from boltz.model.models.boltz1 import Boltz1 as _Boltz1
+        from boltz.model.models.boltz2 import Boltz2 as _Boltz2
+        from boltz.data.types import Manifest as _Manifest, Record as _Record
+        Boltz1 = _Boltz1
+        Boltz2 = _Boltz2
+        Manifest = _Manifest
+        Record = _Record
+
 
 __all__ = [
     "Boltz1",
@@ -113,6 +127,8 @@ def load_model(
     ----------
     model_name : str, optional
         Model to load: "boltz1" or "boltz2". Default is "boltz2".
+
+    Note: This function requires pytorch_lightning and other dependencies to be installed.
     checkpoint : str, optional
         Path to a custom checkpoint file. If None, downloads the default weights.
     device : str, optional
@@ -183,6 +199,9 @@ def load_model(
     from pathlib import Path
 
     import torch
+
+    # Ensure model classes are imported
+    _ensure_imports()
 
     # Determine cache directory
     if cache_dir is None:
@@ -426,6 +445,9 @@ def predict(
     from pathlib import Path
 
     import torch
+
+    # Ensure model classes are imported
+    _ensure_imports()
 
     # Determine paths
     input_path = Path(input_path)
