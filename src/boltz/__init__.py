@@ -555,6 +555,7 @@ def predict(
                 recycling_steps=recycling_steps,
                 num_sampling_steps=sampling_steps,
                 diffusion_samples=diffusion_samples,
+                max_parallel_samples=diffusion_samples,
                 run_confidence_sequentially=True,
             )
 
