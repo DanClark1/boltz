@@ -114,6 +114,7 @@ def load_model(
     device: str = "cpu",
     use_kernels: bool = True,
     cache_dir: str = None,
+    zero_pairwise_bias: bool = False,
     **kwargs,
 ):
     """Load a Boltz model for programmatic use.
@@ -138,6 +139,10 @@ def load_model(
         Default is True.
     cache_dir : str, optional
         Directory to cache downloaded weights. Defaults to ~/.boltz or $BOLTZ_CACHE.
+    zero_pairwise_bias : bool, optional
+        Whether to zero out the bias matrix in the pairwise attention layers
+        (TriangleAttentionStartingNode and TriangleAttentionEndingNode) in the
+        pairformer module. Default is False.
     **kwargs
         Additional arguments passed to the model's load_from_checkpoint method.
         Common options include:
@@ -162,6 +167,10 @@ def load_model(
     With custom checkpoint:
 
         >>> model = boltz.load_model("boltz2", checkpoint="/path/to/weights.ckpt")
+
+    With zeroed pairwise attention bias:
+
+        >>> model = boltz.load_model("boltz2", zero_pairwise_bias=True)
 
     Register hooks for feature extraction:
 
@@ -351,6 +360,20 @@ def load_model(
         **kwargs,
     )
     model.eval()
+
+    # Zero out pairwise attention bias matrices if requested
+    if zero_pairwise_bias:
+        if hasattr(model, 'pairformer_module'):
+            for layer in model.pairformer_module.layers:
+                # Zero out triangle attention starting node bias
+                if hasattr(layer, 'tri_att_start') and hasattr(layer.tri_att_start, 'linear'):
+                    with torch.no_grad():
+                        layer.tri_att_start.linear.weight.zero_()
+                # Zero out triangle attention ending node bias
+                if hasattr(layer, 'tri_att_end') and hasattr(layer.tri_att_end, 'linear'):
+                    with torch.no_grad():
+                        layer.tri_att_end.linear.weight.zero_()
+            print(f"Zeroed out pairwise attention bias matrices in {len(model.pairformer_module.layers)} pairformer layers")
 
     return model
 
