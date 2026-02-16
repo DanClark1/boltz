@@ -69,7 +69,7 @@ For Boltz2 only:
     - affinity_module: Affinity prediction (if affinity_prediction=True)
 """
 from importlib.metadata import PackageNotFoundError, version
-
+import torch.nn as nn
 try:  # noqa: SIM105
     __version__ = version("boltz")
 except PackageNotFoundError:
