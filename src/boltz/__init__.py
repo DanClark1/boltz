@@ -115,6 +115,7 @@ def load_model(
     use_kernels: bool = True,
     cache_dir: str = None,
     zero_pairwise_bias: bool = False,
+    freeze_geometric_representations: bool = False,
     **kwargs,
 ):
     """Load a Boltz model for programmatic use.
@@ -143,6 +144,11 @@ def load_model(
         Whether to zero out the bias matrix in the pairwise attention layers
         (TriangleAttentionStartingNode and TriangleAttentionEndingNode) in the
         pairformer module. Default is False.
+    freeze_geometric_representations : bool, optional
+        Whether to freeze the geometric (pair) representations so they are never
+        updated by the triangular attention layers. When True, the initial pair
+        representations are still used to compute the bias matrices, but the
+        attention outputs don't update the pair representation. Default is False.
     **kwargs
         Additional arguments passed to the model's load_from_checkpoint method.
         Common options include:
@@ -171,6 +177,10 @@ def load_model(
     With zeroed pairwise attention bias:
 
         >>> model = boltz.load_model("boltz2", zero_pairwise_bias=True)
+
+    With frozen geometric representations:
+
+        >>> model = boltz.load_model("boltz2", freeze_geometric_representations=True)
 
     Register hooks for feature extraction:
 
@@ -364,16 +374,47 @@ def load_model(
     # Zero out pairwise attention bias matrices if requested
     if zero_pairwise_bias:
         if hasattr(model, 'pairformer_module'):
+            num_zeroed = 0
             for layer in model.pairformer_module.layers:
-                # Zero out triangle attention starting node bias
-                if hasattr(layer, 'tri_att_start') and hasattr(layer.tri_att_start, 'linear'):
-                    with torch.no_grad():
-                        layer.tri_att_start.linear.weight.zero_()
-                # Zero out triangle attention ending node bias
-                if hasattr(layer, 'tri_att_end') and hasattr(layer.tri_att_end, 'linear'):
-                    with torch.no_grad():
-                        layer.tri_att_end.linear.weight.zero_()
-            print(f"Zeroed out pairwise attention bias matrices in {len(model.pairformer_module.layers)} pairformer layers")
+                # Zero out the pairwise attention bias projection (z -> bias)
+                # This is the AttentionPairBias or AttentionPairBiasV2 module
+                if hasattr(layer, 'attention') and hasattr(layer.attention, 'proj_z'):
+                    # proj_z is a Sequential containing LayerNorm -> Linear -> Rearrange
+                    # We need to zero out the Linear layer
+                    for module in layer.attention.proj_z:
+                        if isinstance(module, nn.Linear):
+                            with torch.no_grad():
+                                module.weight.zero_()
+                            num_zeroed += 1
+                            break
+            print(f"Zeroed out pairwise attention bias projection in {num_zeroed} pairformer layers")
+
+    # Freeze geometric representations if requested
+    if freeze_geometric_representations:
+        if hasattr(model, 'pairformer_module'):
+            def create_freeze_hook(module_name):
+                """Create a forward hook that returns zeros, freezing the geometric updates."""
+                def freeze_hook(module, input, output):
+                    # Return zeros with the same shape as output
+                    # This prevents the residual connection from updating z
+                    return torch.zeros_like(output)
+                return freeze_hook
+
+            num_frozen = 0
+            for layer_idx, layer in enumerate(model.pairformer_module.layers):
+                # Freeze triangle attention starting node
+                if hasattr(layer, 'tri_att_start'):
+                    layer.tri_att_start.register_forward_hook(
+                        create_freeze_hook(f"tri_att_start_layer_{layer_idx}")
+                    )
+                    num_frozen += 1
+                # Freeze triangle attention ending node
+                if hasattr(layer, 'tri_att_end'):
+                    layer.tri_att_end.register_forward_hook(
+                        create_freeze_hook(f"tri_att_end_layer_{layer_idx}")
+                    )
+                    num_frozen += 1
+            print(f"Froze geometric representations in {num_frozen} triangular attention layers across {len(model.pairformer_module.layers)} pairformer layers")
 
     return model
 
