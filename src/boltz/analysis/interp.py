@@ -984,6 +984,8 @@ def plot_top_residue_type_heatmap(
     layer_names: list[str],
     res_names: list[str],
     layer_labels: list[int],
+    sem_scores: Optional[np.ndarray] = None,
+    threshold: float = 0.3,
     annotate: Optional[bool] = None,
     save_path: Optional[str] = None,
 ) -> plt.Figure:
@@ -1002,6 +1004,10 @@ def plot_top_residue_type_heatmap(
     a 20-colour qualitative palette; a shared colorbar labels each colour.
     One-letter codes are printed inside the cells when legible.
 
+    Heads with a normalised semantic KL score below *threshold* are blacked
+    out on both panels, because their residue routing is too uniform to be
+    meaningful.
+
     Parameters
     ----------
     activations : dict
@@ -1010,6 +1016,12 @@ def plot_top_residue_type_heatmap(
         Residue names for each token position.
     layer_labels : list[int]
         Layer depth labels for the y-axis.
+    sem_scores : np.ndarray, optional
+        Normalised semantic KL scores with shape ``[num_layers, num_heads]``
+        (i.e. the ``sem_scores`` array from the permutation analysis).
+        Heads where ``sem_scores[layer, head] < threshold`` are blacked out.
+    threshold : float
+        Minimum semantic score for a head to be shown.  Default ``0.3``.
     annotate : bool, optional
         Whether to print the 1-letter code inside each cell.  Defaults to
         ``True`` when ``num_layers * num_heads <= 400``, else ``False``.
@@ -1072,16 +1084,24 @@ def plot_top_residue_type_heatmap(
     if num_heads is None:
         raise ValueError("No layers processed – check layer_names and activations.")
 
+    # Build the boolean mask (True = black out this cell)
+    if sem_scores is not None:
+        blackout = sem_scores < threshold          # shape [num_layers, num_heads]
+    else:
+        blackout = np.zeros((num_layers, num_heads), dtype=bool)
+
     # Auto-decide annotation
     if annotate is None:
         annotate = (num_layers * num_heads) <= 400
 
     bounds = np.arange(-0.5, n_colors + 0.5)
     norm = BoundaryNorm(bounds, cmap.N)
+    cmap.set_bad("black")   # masked cells → black
 
     fig_h = max(6, num_layers * 0.35 + 2)
     fig, axes = plt.subplots(1, 2, figsize=(18, fig_h))
-    fig.suptitle("Top Attended Residue Type per Head",
+    thresh_str = f"  (sem score < {threshold} blacked out)" if sem_scores is not None else ""
+    fig.suptitle(f"Top Attended Residue Type per Head{thresh_str}",
                  fontsize=13, weight="bold")
 
     for ax, matrix, title in zip(
@@ -1089,8 +1109,11 @@ def plot_top_residue_type_heatmap(
         [bias_matrix, cont_matrix],
         ["Geometric (Pairwise Bias)", "Semantic (QK Content)"],
     ):
-        im = ax.imshow(
-            matrix,
+        # Apply mask: replace blacked-out cells with np.ma.masked
+        display = np.ma.masked_where(blackout, matrix.astype(float))
+
+        ax.imshow(
+            display,
             cmap=cmap,
             norm=norm,
             aspect="auto",
@@ -1108,9 +1131,10 @@ def plot_top_residue_type_heatmap(
             fontsize = max(4, min(8, int(180 / max(num_layers, num_heads))))
             for li in range(num_layers):
                 for hi in range(num_heads):
+                    if blackout[li, hi]:
+                        continue   # leave blacked-out cells empty
                     val = int(matrix[li, hi])
                     letter = AA_1LETTER.get(aa_order[val], "?")
-                    # Choose text colour for contrast against cell background
                     bg = colors[val]
                     luminance = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
                     txt_color = "black" if luminance > 0.45 else "white"
