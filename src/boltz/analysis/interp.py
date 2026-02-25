@@ -973,3 +973,164 @@ def plot_full_extended_analysis(
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
     return fig, bias_corr, content_corr
+
+
+# ---------------------------------------------------------------------------
+# 7. Top residue-type heatmap (per layer × head)
+# ---------------------------------------------------------------------------
+
+def plot_top_residue_type_heatmap(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    layer_labels: list[int],
+    annotate: Optional[bool] = None,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Heatmap showing *which amino acid type* is most attended to per head.
+
+    Two panels side-by-side:
+
+    - **Left** – top attended residue type from the geometric (pairwise bias)
+      component.
+    - **Right** – top attended residue type from the semantic (QK content)
+      component.
+
+    For each layer × head the cell shows the amino acid type (e.g. LEU, GLY)
+    whose positions receive the highest *mean* attention in that head's
+    softmaxed attention map.  Cells are coloured by amino acid identity using
+    a 20-colour qualitative palette; a shared colorbar labels each colour.
+    One-letter codes are printed inside the cells when legible.
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    res_names : list[str]
+        Residue names for each token position.
+    layer_labels : list[int]
+        Layer depth labels for the y-axis.
+    annotate : bool, optional
+        Whether to print the 1-letter code inside each cell.  Defaults to
+        ``True`` when ``num_layers * num_heads <= 400``, else ``False``.
+    save_path : str, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    from matplotlib.colors import BoundaryNorm
+    from matplotlib.cm import ScalarMappable
+
+    # Amino acid encoding – 20 standard AAs + UNK
+    aa_order = _STANDARD_AA_ORDER + ["UNK"]
+    aa_to_idx = {aa: i for i, aa in enumerate(aa_order)}
+    n_colors = len(aa_order)
+
+    # Use a 21-colour qualitative palette (tab20 + one extra for UNK)
+    base_cmap = plt.cm.get_cmap("tab20", 20)
+    colors = [base_cmap(i) for i in range(20)] + [(0.7, 0.7, 0.7, 1.0)]  # grey for UNK
+    from matplotlib.colors import ListedColormap
+    cmap = ListedColormap(colors, name="aa_cmap")
+
+    num_layers = len(layer_names)
+    num_heads: Optional[int] = None
+    bias_matrix: Optional[np.ndarray] = None
+    cont_matrix: Optional[np.ndarray] = None
+
+    for i, name in enumerate(layer_names):
+        attn_bias, nh = _get_attention_maps(activations[name], "bias")
+        attn_cont, _  = _get_attention_maps(activations[name], "content")
+
+        if num_heads is None:
+            num_heads = nh
+            bias_matrix = np.full((num_layers, num_heads), n_colors - 1, dtype=int)
+            cont_matrix = np.full((num_layers, num_heads), n_colors - 1, dtype=int)
+
+        N = min(attn_bias.shape[-1], len(res_names))
+
+        for h in range(num_heads):
+            # Mean attention *received* by each position (column mean)
+            bias_per_pos = attn_bias[h, :N, :N].mean(axis=0)
+            cont_per_pos = attn_cont[h, :N, :N].mean(axis=0)
+
+            # Accumulate by residue type
+            type_bias: dict[str, list[float]] = {}
+            type_cont: dict[str, list[float]] = {}
+            for j, res in enumerate(res_names[:N]):
+                if res in aa_to_idx:
+                    type_bias.setdefault(res, []).append(float(bias_per_pos[j]))
+                    type_cont.setdefault(res, []).append(float(cont_per_pos[j]))
+
+            if type_bias:
+                top_b = max(type_bias, key=lambda r: np.mean(type_bias[r]))
+                bias_matrix[i, h] = aa_to_idx.get(top_b, n_colors - 1)
+            if type_cont:
+                top_c = max(type_cont, key=lambda r: np.mean(type_cont[r]))
+                cont_matrix[i, h] = aa_to_idx.get(top_c, n_colors - 1)
+
+    if num_heads is None:
+        raise ValueError("No layers processed – check layer_names and activations.")
+
+    # Auto-decide annotation
+    if annotate is None:
+        annotate = (num_layers * num_heads) <= 400
+
+    bounds = np.arange(-0.5, n_colors + 0.5)
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    fig_h = max(6, num_layers * 0.35 + 2)
+    fig, axes = plt.subplots(1, 2, figsize=(18, fig_h))
+    fig.suptitle("Top Attended Residue Type per Head",
+                 fontsize=13, weight="bold")
+
+    for ax, matrix, title in zip(
+        axes,
+        [bias_matrix, cont_matrix],
+        ["Geometric (Pairwise Bias)", "Semantic (QK Content)"],
+    ):
+        im = ax.imshow(
+            matrix,
+            cmap=cmap,
+            norm=norm,
+            aspect="auto",
+            interpolation="nearest",
+        )
+        ax.set_xticks(range(num_heads))
+        ax.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=7)
+        ax.set_yticks(range(num_layers))
+        ax.set_yticklabels(layer_labels, fontsize=7)
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer depth")
+        ax.set_title(title)
+
+        if annotate:
+            fontsize = max(4, min(8, int(180 / max(num_layers, num_heads))))
+            for li in range(num_layers):
+                for hi in range(num_heads):
+                    val = int(matrix[li, hi])
+                    letter = AA_1LETTER.get(aa_order[val], "?")
+                    # Choose text colour for contrast against cell background
+                    bg = colors[val]
+                    luminance = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+                    txt_color = "black" if luminance > 0.45 else "white"
+                    ax.text(hi, li, letter, ha="center", va="center",
+                            fontsize=fontsize, color=txt_color, fontweight="bold")
+
+    # Shared colorbar
+    sm = ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes, orientation="vertical",
+                        fraction=0.015, pad=0.02)
+    cbar.set_ticks(range(n_colors))
+    cbar.set_ticklabels(
+        [f"{AA_1LETTER.get(aa, aa)}  {aa}" for aa in aa_order],
+        fontsize=8,
+    )
+    cbar.set_label("Top attended residue type", fontsize=9)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
