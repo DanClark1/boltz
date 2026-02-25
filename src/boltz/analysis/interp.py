@@ -1,0 +1,975 @@
+"""Interpretability analysis for Boltz pairformer attention.
+
+Provides two main analysis extensions:
+
+1. **Residue type analysis** – for both the semantic (QK content) and geometric
+   (pairwise bias) attention components, identifies which amino acid types
+   receive the most attention and plots the distribution by residue category.
+
+2. **Structure correlation analysis** – compares each attention head's bias
+   matrix to the predicted 3D structure (Cα pairwise distance matrix) and
+   measures the Spearman correlation, telling you whether "geometric" heads
+   are actually attending to structurally proximal residues.
+
+Typical Colab workflow
+----------------------
+*During prediction (add to your hook-registration cell):*
+
+    from boltz.analysis.interp import register_metadata_hook, decode_res_types
+    metadata, meta_handle = register_metadata_hook(model)
+    # … run boltz.predict() …
+    res_names = decode_res_types(metadata['res_type'], metadata.get('token_pad_mask'))
+    torch.save({'res_names': res_names}, '/content/drive/MyDrive/metadata.pt')
+    meta_handle.remove()
+
+*During analysis:*
+
+    from boltz.analysis.interp import (
+        load_structure_residues, compute_ca_coords, compute_distance_matrix,
+        plot_residue_type_attention, plot_bias_vs_structure,
+        compute_layer_structure_correlations, plot_structure_correlation_heatmap,
+    )
+    # Load structure for Cα extraction (alternative to metadata hook)
+    res_names, _ = load_structure_residues('prot_no_msa/processed', 'prot_no_msa')
+    coords = torch.load('coords.pt')
+    ca_coords = compute_ca_coords(coords, res_names)
+    ca_dist   = compute_distance_matrix(ca_coords)
+
+    plot_residue_type_attention(activations, layer_names, res_names)
+    plot_bias_vs_structure(activations, layer_names, ca_dist, res_names,
+                           layer_idx=0, head_idx=0)
+    bias_corr    = compute_layer_structure_correlations(activations, layer_names, ca_dist, 'bias')
+    content_corr = compute_layer_structure_correlations(activations, layer_names, ca_dist, 'content')
+    plot_structure_correlation_heatmap(bias_corr, content_corr, layer_labels)
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+# ---------------------------------------------------------------------------
+# Amino-acid metadata
+# ---------------------------------------------------------------------------
+
+AA_CATEGORIES: dict[str, list[str]] = {
+    "Hydrophobic": ["ALA", "VAL", "ILE", "LEU", "MET", "PHE", "TRP", "PRO"],
+    "Polar":       ["SER", "THR", "CYS", "TYR", "ASN", "GLN"],
+    "Charged+":    ["LYS", "ARG", "HIS"],
+    "Charged-":    ["ASP", "GLU"],
+    "Special":     ["GLY"],
+}
+
+AA_TO_CATEGORY: dict[str, str] = {
+    aa: cat for cat, aas in AA_CATEGORIES.items() for aa in aas
+}
+AA_TO_CATEGORY["UNK"] = "Unknown"
+
+_CATEGORY_COLORS: dict[str, str] = {
+    "Hydrophobic": "#E07B7B",
+    "Polar":       "#4ECDC4",
+    "Charged+":    "#45B7D1",
+    "Charged-":    "#96CEB4",
+    "Special":     "#F4D03F",
+    "Unknown":     "#BDC3C7",
+}
+
+AA_1LETTER: dict[str, str] = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "UNK": "X",
+}
+
+# Ordered standard 20 AAs for consistent axis labelling
+_STANDARD_AA_ORDER = [
+    "ALA", "ARG", "ASN", "ASP", "CYS",
+    "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO",
+    "SER", "THR", "TRP", "TYR", "VAL",
+]
+
+# ---------------------------------------------------------------------------
+# 1. Metadata capture hook
+# ---------------------------------------------------------------------------
+
+def register_metadata_hook(model) -> tuple[dict, object]:
+    """Register a pre-hook on the input embedder to capture batch metadata.
+
+    Call **before** ``boltz.predict()``.  The returned *metadata* dict is
+    populated during the forward pass with the tensors needed for residue-type
+    decoding.
+
+    Parameters
+    ----------
+    model:
+        A loaded Boltz model (from ``boltz.load_model()``).
+
+    Returns
+    -------
+    metadata : dict
+        Populated after ``predict()`` with keys ``'res_type'`` and
+        ``'token_pad_mask'``.
+    handle : torch.utils.hooks.RemovableHook
+        Call ``handle.remove()`` once prediction is done.
+
+    Example
+    -------
+    ::
+
+        metadata, handle = register_metadata_hook(model)
+        results = boltz.predict(model, yaml_path, ...)
+        res_names = decode_res_types(metadata['res_type'],
+                                     metadata.get('token_pad_mask'))
+        handle.remove()
+    """
+    metadata: dict = {}
+
+    def _pre_hook(module, args):
+        # args[0] is the batch/feats dict
+        if not args:
+            return
+        batch = args[0]
+        if not isinstance(batch, dict):
+            return
+        if "res_type" in batch:
+            metadata["res_type"] = batch["res_type"].detach().cpu()
+        if "token_pad_mask" in batch:
+            metadata["token_pad_mask"] = batch["token_pad_mask"].detach().cpu()
+
+    handle = model.input_embedder.register_forward_pre_hook(_pre_hook)
+    return metadata, handle
+
+
+def decode_res_types(
+    res_type: torch.Tensor,
+    token_mask: Optional[torch.Tensor] = None,
+) -> list[str]:
+    """Convert the batch ``res_type`` tensor to a list of residue names.
+
+    The featurizer stores ``res_type`` as a one-hot tensor with shape
+    ``[batch, num_tokens, num_token_types]``.  This function decodes it.
+
+    Parameters
+    ----------
+    res_type : torch.Tensor
+        The ``feats['res_type']`` tensor (one-hot or integer-indexed).
+    token_mask : torch.Tensor, optional
+        The ``feats['token_pad_mask']`` tensor.  Only positions where
+        ``mask == 1`` are included in the output.
+
+    Returns
+    -------
+    list[str]
+        Residue names such as ``['ALA', 'GLY', 'TRP', ...]``.
+    """
+    from boltz.data.const import tokens as _token_list
+
+    # Handle batch dimension
+    if res_type.dim() == 3:
+        res_type = res_type[0]          # [num_tokens, num_classes]
+    if res_type.dim() == 2:
+        ids = torch.argmax(res_type, dim=-1).numpy()   # one-hot → int
+    else:
+        ids = res_type.numpy()                          # already integer
+
+    if token_mask is not None:
+        if token_mask.dim() == 2:
+            token_mask = token_mask[0]
+        mask = token_mask.numpy().astype(bool)
+        ids = ids[mask]
+
+    return [
+        (_token_list[int(i)] if 0 <= int(i) < len(_token_list) else "UNK")
+        for i in ids
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 2. Structure / coordinate utilities
+# ---------------------------------------------------------------------------
+
+def load_structure_residues(
+    processed_dir: str | Path,
+    input_stem: Optional[str] = None,
+) -> tuple[list[str], np.ndarray]:
+    """Load residue names from boltz's processed structure NPZ file.
+
+    After ``boltz.predict()`` runs, it saves a processed structure to
+    ``<out_dir>/processed/structures/<input_name>.npz``.  This function
+    reads that file and returns residue names alongside their absolute
+    center-atom (Cα) indices into the full atom array – useful for
+    extracting Cα positions from predicted coordinates.
+
+    Parameters
+    ----------
+    processed_dir : str or Path
+        Path to the ``processed`` subdirectory created by ``boltz.predict()``.
+        E.g. ``'prot_no_msa/processed'``.
+    input_stem : str, optional
+        Stem of the input YAML (without extension).  If ``None`` the first
+        ``.npz`` in ``structures/`` is used.
+
+    Returns
+    -------
+    res_names : list[str]
+        Residue name for each residue in chain order (e.g. ``'ALA'``).
+    atom_center : np.ndarray
+        Absolute atom index of the center atom (Cα) for each residue,
+        indexed into the featurized atom array that matches the predicted
+        coordinate tensor.
+    """
+    from boltz.data.const import canonical_tokens, tokens as token_list
+
+    processed_dir = Path(processed_dir)
+    struct_dir = processed_dir / "structures"
+
+    if input_stem is not None:
+        path = struct_dir / f"{input_stem}.npz"
+    else:
+        paths = sorted(struct_dir.glob("*.npz"))
+        if not paths:
+            raise FileNotFoundError(f"No .npz files found in {struct_dir}")
+        path = paths[0]
+
+    data = np.load(path, allow_pickle=True)
+    residues = data["residues"]  # structured array with Residue dtype
+
+    res_names = [str(r["name"]).strip() for r in residues]
+    atom_center = np.array([int(r["atom_center"]) for r in residues], dtype=np.int64)
+
+    return res_names, atom_center
+
+
+def compute_ca_coords(
+    coords: torch.Tensor,
+    res_names: list[str],
+    sample_idx: int = 0,
+) -> np.ndarray:
+    """Extract Cα (or nucleic-acid C1') coordinates for each residue.
+
+    This function uses the ``ref_atoms`` lookup from ``boltz.data.const``
+    to determine the local atom offset of the center atom within each
+    residue's atom block, then accumulates atom counts to compute absolute
+    indices into the predicted coordinate tensor.
+
+    Works for any mix of protein / nucleic-acid residues (handled via
+    ``ref_atoms``).  Tokens with zero atoms (``PAD``, ``'-'``) are skipped
+    automatically.
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        Predicted atom coordinates with shape
+        ``[diffusion_samples, num_atoms, 3]`` or ``[num_atoms, 3]``.
+    res_names : list[str]
+        Ordered residue names (one per valid token).  Obtain via
+        :func:`decode_res_types` or :func:`load_structure_residues`.
+    sample_idx : int
+        Which diffusion sample to use. Default ``0``.
+
+    Returns
+    -------
+    ca_coords : np.ndarray, shape ``[num_valid_residues, 3]``
+        Cα (or C1') coordinates for each residue that has a known atom
+        layout.  Residues that are not in ``ref_atoms`` are skipped, so
+        the returned array may be shorter than ``res_names``.
+    """
+    from boltz.data.const import ref_atoms
+
+    if coords.dim() == 3:
+        xyz = coords[sample_idx].numpy()
+    else:
+        xyz = coords.numpy()
+
+    ca_list: list[np.ndarray] = []
+    atom_start = 0
+
+    for res_name in res_names:
+        atoms_in_res = ref_atoms.get(res_name, [])
+        n_atoms = len(atoms_in_res)
+
+        if n_atoms == 0:
+            # PAD / gap token – no atoms, skip
+            continue
+
+        # Determine center-atom local offset within this residue's block
+        if "CA" in atoms_in_res:
+            offset = atoms_in_res.index("CA")
+        elif "C1'" in atoms_in_res:
+            offset = atoms_in_res.index("C1'")
+        else:
+            offset = 0  # fallback: first atom
+
+        ca_idx = atom_start + offset
+        if ca_idx < len(xyz):
+            ca_list.append(xyz[ca_idx])
+        else:
+            ca_list.append(np.zeros(3, dtype=np.float32))
+
+        atom_start += n_atoms
+
+    return np.array(ca_list, dtype=np.float32)
+
+
+def compute_distance_matrix(ca_coords: np.ndarray) -> np.ndarray:
+    """Compute pairwise Cα distance matrix.
+
+    Parameters
+    ----------
+    ca_coords : np.ndarray, shape ``[N, 3]``
+
+    Returns
+    -------
+    dist : np.ndarray, shape ``[N, N]``
+        Pairwise Euclidean distances in Ångströms.
+    """
+    diff = ca_coords[:, None, :] - ca_coords[None, :, :]
+    return np.sqrt((diff ** 2).sum(axis=-1))
+
+
+def compute_contact_matrix(
+    ca_coords: np.ndarray,
+    threshold: float = 8.0,
+) -> np.ndarray:
+    """Binary contact map (``True`` where Cα distance < *threshold* Å).
+
+    Parameters
+    ----------
+    ca_coords : np.ndarray, shape ``[N, 3]``
+    threshold : float
+        Default ``8.0`` Å.
+
+    Returns
+    -------
+    contacts : np.ndarray of bool, shape ``[N, N]``
+    """
+    return compute_distance_matrix(ca_coords) < threshold
+
+
+# ---------------------------------------------------------------------------
+# 3. Attention helpers (shared by analysis functions)
+# ---------------------------------------------------------------------------
+
+def _get_attention_maps(data: dict, component: str) -> tuple[np.ndarray, int]:
+    """Recompute softmaxed attention maps for all heads in one layer.
+
+    Parameters
+    ----------
+    data : dict
+        One entry from the ``activations`` dict, with keys ``'q'``, ``'k'``,
+        ``'bias'``.
+    component : str
+        One of ``'bias'``, ``'content'``, or ``'full'``.
+
+    Returns
+    -------
+    attn : np.ndarray, shape ``[num_heads, N, N]``
+    num_heads : int
+    """
+    q_raw = data["q"].float()
+    k_raw = data["k"].float()
+    bias = data["bias"].float()
+
+    B, N, Hidden = q_raw.shape
+
+    if bias.shape[-1] == N:
+        num_heads = bias.shape[1]   # already [B, H, N, N]
+    else:
+        num_heads = bias.shape[-1]  # [B, N, N, H] → permute
+        bias = bias.permute(0, 3, 1, 2)
+
+    head_dim = Hidden // num_heads
+    q = q_raw.view(B, N, num_heads, head_dim).transpose(1, 2)
+    k = k_raw.view(B, N, num_heads, head_dim).transpose(1, 2)
+
+    attn_maps = np.empty((num_heads, N, N), dtype=np.float32)
+    for h in range(num_heads):
+        q_h = q[0, h]
+        k_h = k[0, h]
+        b_h = bias[0, h]
+        content = torch.matmul(q_h, k_h.T) / (head_dim ** 0.5)
+
+        if component == "bias":
+            attn_h = torch.softmax(b_h, dim=-1)
+        elif component == "content":
+            attn_h = torch.softmax(content, dim=-1)
+        elif component == "full":
+            attn_h = torch.softmax(content + b_h, dim=-1)
+        else:
+            raise ValueError(f"Unknown component: {component!r}")
+
+        attn_maps[h] = attn_h.numpy()
+
+    return attn_maps, num_heads
+
+
+def _layer_idx_from_name(name: str) -> int:
+    m = re.search(r"layers\.(\d+)", name)
+    return int(m.group(1)) if m else -1
+
+
+# ---------------------------------------------------------------------------
+# 4. Residue-type attention analysis
+# ---------------------------------------------------------------------------
+
+def _aggregate_type_attention(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    component: str,
+) -> dict[str, list[float]]:
+    """Return {res_name: [attention_values…]} across all layers/heads."""
+    type_attn: dict[str, list[float]] = {}
+
+    for name in layer_names:
+        attn_maps, num_heads = _get_attention_maps(activations[name], component)
+        N = min(attn_maps.shape[-1], len(res_names))
+
+        for h in range(num_heads):
+            # Mean attention *received* by each position (column mean)
+            per_pos = attn_maps[h, :N, :N].mean(axis=0)  # shape [N]
+            for i, res in enumerate(res_names[:N]):
+                type_attn.setdefault(res, []).append(float(per_pos[i]))
+
+    return type_attn
+
+
+def plot_residue_type_attention(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    fig_title: str = "Residue Type Attention Analysis",
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Bar charts showing which amino acid types receive the most attention.
+
+    Two panels side-by-side: semantic (QK content) vs geometric (pairwise
+    bias).  Bars are coloured by biochemical category.
+
+    Parameters
+    ----------
+    activations : dict
+        The captured activations dict (keys are layer names).
+    layer_names : list[str]
+        Ordered list of layer names, as used in the KL analysis.
+    res_names : list[str]
+        Residue name for each token position.  Obtain from
+        :func:`decode_res_types` or :func:`load_structure_residues`.
+    fig_title : str
+    save_path : str, optional
+        If given, saves the figure to this path.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    content_ta = _aggregate_type_attention(
+        activations, layer_names, res_names, "content"
+    )
+    bias_ta = _aggregate_type_attention(
+        activations, layer_names, res_names, "bias"
+    )
+
+    # Only protein residues present in the sequence
+    present = {r for r in res_names if r in AA_1LETTER}
+    # Sort in canonical AA order
+    unique_res = [r for r in _STANDARD_AA_ORDER if r in present]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle(fig_title, fontsize=14, weight="bold")
+
+    for ax, (label, ta) in zip(
+        axes,
+        [
+            ("Semantic – Content (QK\u1d40)", content_ta),
+            ("Geometric – Pairwise Bias", bias_ta),
+        ],
+    ):
+        if not unique_res:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes)
+            ax.set_title(label)
+            continue
+
+        means = [np.mean(ta[r]) if r in ta else 0.0 for r in unique_res]
+        colors = [
+            _CATEGORY_COLORS.get(AA_TO_CATEGORY.get(r, "Unknown"), "#BDC3C7")
+            for r in unique_res
+        ]
+        xlabels = [f"{AA_1LETTER.get(r, r)}\n({r})" for r in unique_res]
+
+        # Sort descending by mean attention
+        order = np.argsort(means)[::-1]
+        means   = [means[i]   for i in order]
+        colors  = [colors[i]  for i in order]
+        xlabels = [xlabels[i] for i in order]
+
+        ax.bar(range(len(xlabels)), means, color=colors)
+        ax.set_xticks(range(len(xlabels)))
+        ax.set_xticklabels(xlabels, fontsize=8)
+        ax.set_ylabel("Mean attention weight (avg over all layers & heads)")
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3, axis="y")
+
+    # Shared legend
+    legend_handles = [
+        mpatches.Patch(facecolor=c, label=cat)
+        for cat, c in _CATEGORY_COLORS.items()
+        if cat != "Unknown"
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=5,
+               bbox_to_anchor=(0.5, -0.06), frameon=False)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def plot_top_attended_residues_for_head(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    layer_idx: int,
+    head_idx: int,
+    top_k: int = 15,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """For a specific layer/head, show which residue *positions* receive the
+    most attention for the bias vs content components.
+
+    Bars are coloured by biochemical category and labelled with position
+    index and one-letter code.
+
+    Parameters
+    ----------
+    activations, layer_names, res_names
+        As in other functions.
+    layer_idx : int
+        Index into *layer_names*.
+    head_idx : int
+        Head index (0-based).
+    top_k : int
+        Number of top positions to show.  Default 15.
+    save_path : str, optional
+    """
+    name = layer_names[layer_idx]
+    lay_real = _layer_idx_from_name(name)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    fig.suptitle(
+        f"Top-{top_k} Attended Positions — Layer {lay_real}, Head {head_idx}",
+        fontsize=13, weight="bold",
+    )
+
+    for ax, component in zip(axes, ["content", "bias"]):
+        attn_maps, num_heads = _get_attention_maps(activations[name], component)
+        if head_idx >= num_heads:
+            ax.text(0.5, 0.5, f"Head {head_idx} not found", ha="center",
+                    va="center", transform=ax.transAxes)
+            continue
+
+        N = min(attn_maps.shape[-1], len(res_names))
+        attn = attn_maps[head_idx, :N, :N]
+        per_pos = attn.mean(axis=0)  # [N] – mean attention received
+
+        top_idx = np.argsort(per_pos)[::-1][:top_k]
+        vals    = per_pos[top_idx]
+        colors  = [
+            _CATEGORY_COLORS.get(AA_TO_CATEGORY.get(res_names[i], "Unknown"), "#BDC3C7")
+            for i in top_idx
+        ]
+        xlabels = [
+            f"{i}: {AA_1LETTER.get(res_names[i], '?')}\n({res_names[i]})"
+            for i in top_idx
+        ]
+
+        ax.bar(range(top_k), vals, color=colors)
+        ax.set_xticks(range(top_k))
+        ax.set_xticklabels(xlabels, fontsize=8, rotation=30, ha="right")
+        ax.set_ylabel("Mean attention received")
+        comp_label = "Semantic (QK Content)" if component == "content" else "Geometric (Bias)"
+        ax.set_title(comp_label)
+        ax.grid(True, alpha=0.3, axis="y")
+
+    legend_handles = [
+        mpatches.Patch(facecolor=c, label=cat)
+        for cat, c in _CATEGORY_COLORS.items()
+        if cat != "Unknown"
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=5,
+               bbox_to_anchor=(0.5, -0.08), frameon=False)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 5. Structure correlation analysis
+# ---------------------------------------------------------------------------
+
+def _spearman(x: np.ndarray, y: np.ndarray) -> float:
+    from scipy import stats
+    if len(x) < 5:
+        return 0.0
+    r, _ = stats.spearmanr(x, y)
+    return float(r) if np.isfinite(r) else 0.0
+
+
+def compute_layer_structure_correlations(
+    activations: dict,
+    layer_names: list[str],
+    ca_dist_matrix: np.ndarray,
+    component: str = "bias",
+    seq_sep: int = 3,
+) -> np.ndarray:
+    """Spearman correlation between attention weights and structural proximity.
+
+    For each layer × head, computes the Spearman r between the softmaxed
+    attention values and *1 / (Cα distance + 1)* (i.e. higher = closer in
+    3D).  A positive correlation means the head preferentially attends to
+    structurally nearby residues.
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    ca_dist_matrix : np.ndarray, shape ``[N, N]``
+        Pairwise Cα distance matrix from :func:`compute_distance_matrix`.
+    component : {'bias', 'content', 'full'}
+    seq_sep : int
+        Exclude residue pairs closer than this in sequence (to avoid trivial
+        local attention dominating the correlation).  Default ``3``.
+
+    Returns
+    -------
+    corr : np.ndarray, shape ``[num_layers, num_heads]``
+        Spearman r values.
+    """
+    num_layers = len(layer_names)
+    corr_matrix: Optional[np.ndarray] = None
+
+    for i, name in enumerate(layer_names):
+        attn_maps, num_heads = _get_attention_maps(activations[name], component)
+
+        if corr_matrix is None:
+            corr_matrix = np.zeros((num_layers, num_heads), dtype=np.float32)
+
+        N = min(attn_maps.shape[-1], ca_dist_matrix.shape[0])
+
+        # Build a flat off-diagonal mask that excludes nearby-in-sequence pairs
+        row_idx, col_idx = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
+        mask = (np.abs(row_idx - col_idx) >= seq_sep)       # exclude nearby in seq
+        mask &= (ca_dist_matrix[:N, :N] > 0)               # exclude zero-coord atoms
+        mask &= ~np.eye(N, dtype=bool)                      # exclude diagonal
+
+        inv_dist = 1.0 / (ca_dist_matrix[:N, :N] + 1.0)    # structural proximity
+
+        for h in range(num_heads):
+            attn_flat = attn_maps[h, :N, :N][mask]
+            prox_flat = inv_dist[mask]
+            corr_matrix[i, h] = _spearman(attn_flat, prox_flat)
+
+    return corr_matrix if corr_matrix is not None else np.zeros((num_layers, 1))
+
+
+def plot_bias_vs_structure(
+    activations: dict,
+    layer_names: list[str],
+    ca_dist_matrix: np.ndarray,
+    res_names: list[str],
+    layer_idx: int,
+    head_idx: int,
+    zoom: int = 80,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Side-by-side comparison of bias / content attention vs predicted structure.
+
+    Shows six panels:
+    - Bias attention heatmap
+    - Content attention heatmap
+    - Full (bias + content) attention heatmap
+    - Structural proximity (1/(d+1)) heatmap
+    - Contact map (< 8 Å)
+    - Scatter: bias attention vs Cα distance (with Pearson r)
+
+    Parameters
+    ----------
+    activations, layer_names, res_names
+        Standard analysis inputs.
+    ca_dist_matrix : np.ndarray, shape ``[N, N]``
+    layer_idx : int
+        Index into *layer_names*.
+    head_idx : int
+    zoom : int
+        Crop all heatmaps to the first *zoom* residues for legibility.
+    save_path : str, optional
+    """
+    name = layer_names[layer_idx]
+    lay_real = _layer_idx_from_name(name)
+
+    bias_maps, num_heads = _get_attention_maps(activations[name], "bias")
+    cont_maps, _         = _get_attention_maps(activations[name], "content")
+    full_maps, _         = _get_attention_maps(activations[name], "full")
+
+    if head_idx >= num_heads:
+        raise ValueError(f"head_idx={head_idx} but only {num_heads} heads in this layer.")
+
+    N_full = bias_maps.shape[-1]
+    N = min(N_full, ca_dist_matrix.shape[0], len(res_names), zoom)
+
+    attn_bias = bias_maps[head_idx, :N, :N]
+    attn_cont = cont_maps[head_idx, :N, :N]
+    attn_full = full_maps[head_idx, :N, :N]
+
+    dist_crop = ca_dist_matrix[:N, :N]
+    inv_dist  = 1.0 / (dist_crop + 1.0)
+    inv_dist_n = inv_dist / (inv_dist.max() + 1e-9)
+    contacts  = (dist_crop < 8.0).astype(float)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle(
+        f"Layer {lay_real}, Head {head_idx}: Attention vs Predicted Structure",
+        fontsize=14, weight="bold",
+    )
+
+    # Row 0: attention matrices
+    sns.heatmap(attn_bias, cmap="cividis", ax=axes[0, 0], cbar=True,
+                vmin=0, vmax=1, xticklabels=False, yticklabels=False)
+    axes[0, 0].set_title("Bias Attention (Geometric)")
+
+    sns.heatmap(attn_cont, cmap="magma", ax=axes[0, 1], cbar=True,
+                vmin=0, vmax=1, xticklabels=False, yticklabels=False)
+    axes[0, 1].set_title("Content Attention (Semantic)")
+
+    sns.heatmap(attn_full, cmap="viridis", ax=axes[0, 2], cbar=True,
+                vmin=0, vmax=1, xticklabels=False, yticklabels=False)
+    axes[0, 2].set_title("Full Attention (Bias + Content)")
+
+    # Row 1: structure
+    sns.heatmap(inv_dist_n, cmap="hot_r", ax=axes[1, 0], cbar=True,
+                vmin=0, vmax=1, xticklabels=False, yticklabels=False)
+    axes[1, 0].set_title("Structural Proximity  1/(Cα dist + 1)")
+
+    sns.heatmap(contacts, cmap="Greens", ax=axes[1, 1], cbar=True,
+                vmin=0, vmax=1, xticklabels=False, yticklabels=False)
+    axes[1, 1].set_title("Contact Map (< 8 Å)")
+
+    # Scatter: bias attention vs distance
+    ax = axes[1, 2]
+    mask_s = ~np.eye(N, dtype=bool)
+    d_flat = dist_crop[mask_s]
+    a_flat = attn_bias[mask_s]
+
+    # Subsample for speed if very large
+    if len(d_flat) > 20_000:
+        idx = np.random.choice(len(d_flat), 20_000, replace=False)
+        d_flat, a_flat = d_flat[idx], a_flat[idx]
+
+    ax.scatter(d_flat, a_flat, alpha=0.06, s=4, c="#7B2FBE", rasterized=True)
+
+    # Trend / Pearson r
+    valid = (d_flat > 0) & (d_flat < 60)
+    if valid.sum() > 20:
+        from scipy import stats as _stats
+        slope, intercept, r_val, _, _ = _stats.linregress(d_flat[valid], a_flat[valid])
+        x_line = np.linspace(d_flat[valid].min(), d_flat[valid].max(), 100)
+        ax.plot(x_line, slope * x_line + intercept, "r-", lw=1.5,
+                label=f"Pearson r = {r_val:.3f}")
+        ax.legend(fontsize=9)
+
+    ax.set_xlabel("Cα distance (Å)")
+    ax.set_ylabel("Bias attention weight")
+    ax.set_title("Bias Attention vs Cα Distance")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def plot_structure_correlation_heatmap(
+    corr_bias: np.ndarray,
+    corr_content: np.ndarray,
+    layer_labels: list[int],
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Heatmap of per-head structure correlation (Spearman r) for bias and content.
+
+    Red = positive correlation (head attends to structurally close residues),
+    Blue = negative correlation.
+
+    Parameters
+    ----------
+    corr_bias : np.ndarray, shape ``[num_layers, num_heads]``
+        From :func:`compute_layer_structure_correlations` with
+        ``component='bias'``.
+    corr_content : np.ndarray, shape ``[num_layers, num_heads]``
+    layer_labels : list[int]
+        Layer depth labels (e.g. ``[0, 1, 2, …]``).
+    save_path : str, optional
+    """
+    num_heads = corr_bias.shape[1]
+    vmax = max(np.abs(corr_bias).max(), np.abs(corr_content).max(), 0.05)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig.suptitle(
+        "Attention–Structure Correlation (Spearman r with 1/Cα-distance)",
+        fontsize=13, weight="bold",
+    )
+
+    for ax, data, title in zip(
+        axes,
+        [corr_bias, corr_content],
+        ["Bias (Geometric) ↔ Structure", "Content (Semantic) ↔ Structure"],
+    ):
+        sns.heatmap(
+            data,
+            cmap="RdBu_r",
+            center=0,
+            vmin=-vmax,
+            vmax=vmax,
+            yticklabels=layer_labels,
+            xticklabels=[f"H{i}" for i in range(num_heads)],
+            ax=ax,
+        )
+        ax.set_title(title)
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer depth")
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 6. Omnibus extended analysis
+# ---------------------------------------------------------------------------
+
+def plot_full_extended_analysis(
+    activations: dict,
+    layer_names: list[str],
+    ca_dist_matrix: np.ndarray,
+    res_names: list[str],
+    geo_scores: np.ndarray,
+    sem_scores: np.ndarray,
+    layer_labels: list[int],
+    save_path: Optional[str] = None,
+) -> tuple[plt.Figure, np.ndarray, np.ndarray]:
+    """Six-panel summary combining KL scores with structure correlation.
+
+    Panels:
+    - (0,0) Geometric KL heatmap  (0,1) Semantic KL heatmap
+    - (1,0) Bias×Structure corr   (1,1) Content×Structure corr
+    - (2,0) Mean-per-layer line   (2,1) KL score vs structure corr scatter
+
+    Parameters
+    ----------
+    activations, layer_names, res_names
+        Standard inputs.
+    ca_dist_matrix : np.ndarray, shape ``[N, N]``
+    geo_scores, sem_scores : np.ndarray, shape ``[num_layers, num_heads]``
+        Normalised KL scores from the original permutation analysis.
+    layer_labels : list[int]
+    save_path : str, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    bias_corr : np.ndarray
+    content_corr : np.ndarray
+    """
+    num_heads = geo_scores.shape[1]
+
+    print("Computing bias–structure correlations …")
+    bias_corr = compute_layer_structure_correlations(
+        activations, layer_names, ca_dist_matrix, "bias"
+    )
+    print("Computing content–structure correlations …")
+    content_corr = compute_layer_structure_correlations(
+        activations, layer_names, ca_dist_matrix, "content"
+    )
+
+    vmax_corr = max(np.abs(bias_corr).max(), np.abs(content_corr).max(), 0.05)
+
+    fig, axes = plt.subplots(3, 2, figsize=(16, 18))
+    fig.suptitle("Extended Pairformer Interpretability Analysis",
+                 fontsize=14, weight="bold")
+
+    # Row 0: KL importance
+    sns.heatmap(geo_scores, cmap="Reds", vmin=0, vmax=1,
+                yticklabels=layer_labels,
+                xticklabels=[f"H{i}" for i in range(num_heads)],
+                ax=axes[0, 0])
+    axes[0, 0].set_title("Geometric Importance (KL, Bias permuted)")
+    axes[0, 0].set_xlabel("Head"); axes[0, 0].set_ylabel("Layer")
+
+    sns.heatmap(sem_scores, cmap="Blues", vmin=0, vmax=1,
+                yticklabels=layer_labels,
+                xticklabels=[f"H{i}" for i in range(num_heads)],
+                ax=axes[0, 1])
+    axes[0, 1].set_title("Semantic Importance (KL, Content permuted)")
+    axes[0, 1].set_xlabel("Head"); axes[0, 1].set_ylabel("Layer")
+
+    # Row 1: structure correlations
+    sns.heatmap(bias_corr, cmap="RdBu_r", center=0,
+                vmin=-vmax_corr, vmax=vmax_corr,
+                yticklabels=layer_labels,
+                xticklabels=[f"H{i}" for i in range(num_heads)],
+                ax=axes[1, 0])
+    axes[1, 0].set_title("Bias × Structural Proximity (Spearman r)")
+    axes[1, 0].set_xlabel("Head"); axes[1, 0].set_ylabel("Layer")
+
+    sns.heatmap(content_corr, cmap="RdBu_r", center=0,
+                vmin=-vmax_corr, vmax=vmax_corr,
+                yticklabels=layer_labels,
+                xticklabels=[f"H{i}" for i in range(num_heads)],
+                ax=axes[1, 1])
+    axes[1, 1].set_title("Content × Structural Proximity (Spearman r)")
+    axes[1, 1].set_xlabel("Head"); axes[1, 1].set_ylabel("Layer")
+
+    # Row 2: mean-per-layer line plot
+    ax = axes[2, 0]
+    ax.plot(layer_labels, geo_scores.mean(axis=1),   "r-o",  ms=4, label="Geo KL (bias)")
+    ax.plot(layer_labels, sem_scores.mean(axis=1),   "b-s",  ms=4, label="Sem KL (content)")
+    ax.plot(layer_labels, bias_corr.mean(axis=1),    "r--^", ms=4, label="Bias↔Structure r")
+    ax.plot(layer_labels, content_corr.mean(axis=1), "b--v", ms=4, label="Content↔Structure r")
+    ax.axhline(0, color="gray", ls=":", alpha=0.5)
+    ax.set_xlabel("Layer depth"); ax.set_ylabel("Score / Correlation")
+    ax.set_title("Layer-wise Summary")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    # Row 2 right: KL vs structure-corr scatter
+    ax = axes[2, 1]
+    ax.scatter(geo_scores.flatten(), bias_corr.flatten(),
+               c="red",  alpha=0.4, s=15, label="Bias (geo)")
+    ax.scatter(sem_scores.flatten(), content_corr.flatten(),
+               c="blue", alpha=0.4, s=15, label="Content (sem)")
+    ax.set_xlabel("KL Importance Score (normalised)")
+    ax.set_ylabel("Structure Correlation (Spearman r)")
+    ax.set_title("KL Importance vs Structure Correlation\n(per head)")
+    ax.axhline(0, color="gray", ls=":", alpha=0.3)
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig, bias_corr, content_corr
