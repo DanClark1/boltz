@@ -375,7 +375,7 @@ from boltz.analysis.interp import (
 
 DRIVE    = "/content/drive/MyDrive"
 OUT_ROOT = f"{DRIVE}/final_experiments"
-EXAMPLES = ["prot_no_msa", "prot", "multimer", "ligand"]
+EXAMPLES = ["prot_no_msa", "prot", "multimer", "cyclic_prot"]
 
 def _layer_idx(name):
     m = re.search(r"layers\.(\d+)", name)
