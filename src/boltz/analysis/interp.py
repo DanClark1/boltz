@@ -1393,22 +1393,26 @@ def run_kl_analysis(
 
             content = torch.matmul(q_h, k_h.T) / (head_dim ** 0.5)  # [N, N]
             A       = torch.softmax(content + b_h, dim=-1)           # [N, N]
-            log_A   = torch.log(A + eps)
+            A_safe  = torch.clamp(A, min=eps)
 
             geo_kl = 0.0
             sem_kl = 0.0
             for _ in range(num_trials):
-                perm = torch.randperm(N)
+                # Per-row independent key-dimension shuffle — each query gets its
+                # own random ordering of keys.  Using separate perm tensors for
+                # geo and sem keeps the two ablations independent.
+                perm_geo = torch.rand(N, N).argsort(dim=-1)   # [N, N]
+                perm_sem = torch.rand(N, N).argsort(dim=-1)   # [N, N]
 
-                # Geo: permute spatial layout of bias (shuffle residue positions)
-                b_perm  = b_h[perm][:, perm]
-                A_geo   = torch.softmax(content + b_perm, dim=-1)
-                geo_kl += (A * (log_A - torch.log(A_geo + eps))).sum(-1).mean().item()
+                # Geo: scramble key dimension of bias per row → destroys spatial routing
+                b_perm = torch.gather(b_h, -1, perm_geo)
+                A_geo  = torch.clamp(torch.softmax(content + b_perm, dim=-1), min=eps)
+                geo_kl += (A_safe * (A_safe.log() - A_geo.log())).sum(-1).mean().item()
 
-                # Sem: permute query positions in content (shuffle content routing)
-                c_perm  = content[perm]
-                A_sem   = torch.softmax(c_perm + b_h, dim=-1)
-                sem_kl += (A * (log_A - torch.log(A_sem + eps))).sum(-1).mean().item()
+                # Sem: scramble key dimension of content per row → destroys semantic routing
+                c_perm = torch.gather(content, -1, perm_sem)
+                A_sem  = torch.clamp(torch.softmax(c_perm + b_h, dim=-1), min=eps)
+                sem_kl += (A_safe * (A_safe.log() - A_sem.log())).sum(-1).mean().item()
 
             geo_raw[i, h] = geo_kl / num_trials
             sem_raw[i, h] = sem_kl / num_trials

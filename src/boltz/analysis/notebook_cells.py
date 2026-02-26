@@ -306,9 +306,14 @@ for example in EXAMPLES:
 
     def get_hook(layer_name, component_name):
         def hook(module, input, output):
-            activations.setdefault(layer_name, {}) \
-                       .setdefault(component_name, []) \
-                       .append(output.detach().cpu().clone())
+            # Overwrite on every recycling step (keep only the latest).
+            # Stored as a 1-element list so get_recycling_step(step=-1) still works.
+            # fp16 halves memory; precision is fine for KL/attention analysis.
+            if layer_name not in activations:
+                activations[layer_name] = {}
+            activations[layer_name][component_name] = [
+                output.detach().cpu().half()
+            ]
         return hook
 
     hook_handles = []
@@ -318,7 +323,7 @@ for example in EXAMPLES:
                 module.proj_q.register_forward_hook(get_hook(name, "q")),
                 module.proj_k.register_forward_hook(get_hook(name, "k")),
                 module.proj_z.register_forward_hook(get_hook(name, "bias")),
-                module.proj_o.register_forward_hook(get_hook(name, "o")),
+                # proj_o is not used in any analysis — skip to save memory.
             ]
 
     yaml_path = f"{YAML_DIR}/{example}.yaml"
@@ -411,10 +416,12 @@ for example in EXAMPLES:
     print("  Running KL analysis …", flush=True)
     geo_raw, sem_raw = run_kl_analysis(acts, layer_names, num_trials=5)
 
-    # Normalise with a shared 95th percentile
-    p95        = np.percentile(np.concatenate([geo_raw.ravel(), sem_raw.ravel()]), 95)
-    geo_scores = np.clip(geo_raw / (p95 + 1e-10), 0, 1)
-    sem_scores = np.clip(sem_raw / (p95 + 1e-10), 0, 1)
+    # Normalise each axis against its own 95th percentile so both heatmaps
+    # span [0, 1] — matching the original analysis.
+    geo_p95    = np.percentile(geo_raw, 95)
+    sem_p95    = np.percentile(sem_raw, 95)
+    geo_scores = np.clip(geo_raw / (geo_p95 + 1e-10), 0, 1)
+    sem_scores = np.clip(sem_raw / (sem_p95 + 1e-10), 0, 1)
     print(f"  geo mean={geo_scores.mean():.3f}  sem mean={sem_scores.mean():.3f}")
 
     # ------------------------------------------------------------------
