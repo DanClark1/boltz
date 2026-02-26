@@ -266,4 +266,204 @@ for cat_name, indices in valid_cats.items():   # valid_cats from your KL cell
             top_k=15,
             save_path=f"/content/drive/MyDrive/{file_name}_{safe}_L{layer_idx}H{head_idx}_residues.png",
         )
+
+
+──────────────────────────────────────────────────────────────────────────────
+CELL 10 – Inference pipeline  (run once per example to capture activations)
+          Loops over four YAML inputs and saves recycling-aware activations,
+          coordinates and residue metadata to Drive.
+──────────────────────────────────────────────────────────────────────────────
+
+import os, re, torch
+import boltz
+from boltz.analysis.interp import register_metadata_hook, decode_res_types, get_recycling_step
+
+DRIVE    = "/content/drive/MyDrive"
+YAML_DIR = f"{DRIVE}/gdl/examples"
+OUT_DIR  = f"{DRIVE}/final_experiments"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+EXAMPLES = ["prot_no_msa", "prot", "multimer", "ligand"]
+
+# Load model once
+model = boltz.load_model("boltz1", device="cuda", use_kernels=False)
+
+import shutil, tempfile
+
+for example in EXAMPLES:
+    save_base = f"{OUT_DIR}/{example}/raw"
+    os.makedirs(save_base, exist_ok=True)
+
+    acts_path = f"{save_base}/activations.pt"
+    if os.path.exists(acts_path):
+        print(f"[{example}] Already captured – skipping inference.")
+        continue
+
+    print(f"\n{'='*60}\n[{example}] Running inference …")
+
+    metadata, meta_handle = register_metadata_hook(model)
+    activations = {}
+
+    def get_hook(layer_name, component_name):
+        def hook(module, input, output):
+            activations.setdefault(layer_name, {}) \
+                       .setdefault(component_name, []) \
+                       .append(output.detach().cpu().clone())
+        return hook
+
+    hook_handles = []
+    for name, module in model.named_modules():
+        if "AttentionPairBias" in str(type(module)):
+            hook_handles += [
+                module.proj_q.register_forward_hook(get_hook(name, "q")),
+                module.proj_k.register_forward_hook(get_hook(name, "k")),
+                module.proj_z.register_forward_hook(get_hook(name, "bias")),
+                module.proj_o.register_forward_hook(get_hook(name, "o")),
+            ]
+
+    yaml_path = f"{YAML_DIR}/{example}.yaml"
+
+    # Route boltz output to /tmp so processed inputs, MSA files and
+    # prediction CIFs don't accumulate on the local Colab disk.
+    tmp_out = f"/tmp/boltz_{example}"
+    try:
+        results = boltz.predict(model, yaml_path, out_dir=tmp_out,
+                                use_msa_server=True,
+                                recycling_steps=3, diffusion_samples=1)
+
+        res_names = decode_res_types(metadata["res_type"],
+                                      metadata.get("token_pad_mask"))
+        print(f"  Sequence length: {len(res_names)} tokens")
+
+        torch.save(activations,          f"{save_base}/activations.pt")
+        torch.save(results[0]["coords"], f"{save_base}/coords.pt")
+        torch.save({"res_names": res_names}, f"{save_base}/meta.pt")
+        print(f"  Saved to {save_base}")
+    finally:
+        # Always clean up the local boltz scratch dir
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        for h in hook_handles: h.remove()
+        meta_handle.remove()
+        activations.clear()
+
+print("\nInference complete.")
+
+
+──────────────────────────────────────────────────────────────────────────────
+CELL 11 – Analysis & figure pipeline
+          Loads saved activations for each example and generates all plots
+          into /content/drive/MyDrive/final_experiments/<example>/.
+──────────────────────────────────────────────────────────────────────────────
+
+import os, re, numpy as np, torch
+from boltz.analysis.interp import (
+    get_recycling_step,
+    compute_ca_coords,
+    compute_distance_matrix,
+    run_kl_analysis,
+    plot_kl_heatmaps_separate,
+    plot_kl_heatmap_combined,
+    plot_semantic_peaks,
+    plot_structure_vs_top_geo_bias,
+    plot_bias_sampled_layers,
+)
+
+DRIVE    = "/content/drive/MyDrive"
+OUT_ROOT = f"{DRIVE}/final_experiments"
+EXAMPLES = ["prot_no_msa", "prot", "multimer", "ligand"]
+
+def _layer_idx(name):
+    m = re.search(r"layers\.(\d+)", name)
+    return int(m.group(1)) if m else -1
+
+for example in EXAMPLES:
+    raw_dir = f"{OUT_ROOT}/{example}/raw"
+    out_dir = f"{OUT_ROOT}/{example}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    acts_path = f"{raw_dir}/activations.pt"
+    if not os.path.exists(acts_path):
+        print(f"[{example}] No activations found – run Cell 10 first.")
+        continue
+
+    print(f"\n{'='*60}\n[{example}] Loading data …")
+    all_acts  = torch.load(acts_path,            map_location="cpu")
+    coords    = torch.load(f"{raw_dir}/coords.pt",  map_location="cpu")
+    meta      = torch.load(f"{raw_dir}/meta.pt",    map_location="cpu")
+    res_names = meta["res_names"]
+
+    # Main pairformer layers only (startswith filter avoids confidence module)
+    layer_names  = sorted(
+        [k for k in all_acts if k.startswith("pairformer_module.")],
+        key=_layer_idx,
+    )
+    layer_labels = [_layer_idx(n) for n in layer_names]
+    print(f"  Layers: {len(layer_names)}   Residues: {len(res_names)}")
+
+    # Final recycling step activations
+    acts = get_recycling_step(all_acts, step=-1)
+
+    # Cα distance matrix
+    ca_coords = compute_ca_coords(coords, res_names, sample_idx=0)
+    ca_dist   = compute_distance_matrix(ca_coords)
+
+    # KL analysis (may take ~1–2 min for large structures)
+    print("  Running KL analysis …", flush=True)
+    geo_raw, sem_raw = run_kl_analysis(acts, layer_names, num_trials=5)
+
+    # Normalise with a shared 95th percentile
+    p95        = np.percentile(np.concatenate([geo_raw.ravel(), sem_raw.ravel()]), 95)
+    geo_scores = np.clip(geo_raw / (p95 + 1e-10), 0, 1)
+    sem_scores = np.clip(sem_raw / (p95 + 1e-10), 0, 1)
+    print(f"  geo mean={geo_scores.mean():.3f}  sem mean={sem_scores.mean():.3f}")
+
+    # ------------------------------------------------------------------
+    # RQ1-1  Separate academic heatmaps (geo / sem)
+    # ------------------------------------------------------------------
+    plot_kl_heatmaps_separate(
+        geo_scores, sem_scores, layer_labels,
+        save_geo=f"{out_dir}/rq1_geo_heatmap.png",
+        save_sem=f"{out_dir}/rq1_sem_heatmap.png",
+    )
+
+    # ------------------------------------------------------------------
+    # RQ1-2  Combined geo|sem heatmap
+    # ------------------------------------------------------------------
+    plot_kl_heatmap_combined(
+        geo_scores, sem_scores, layer_labels,
+        save_path=f"{out_dir}/rq1_combined_heatmap.png",
+    )
+
+    # ------------------------------------------------------------------
+    # RQ1-3  Semantic peaks & residue-category analysis
+    # ------------------------------------------------------------------
+    plot_semantic_peaks(
+        acts, layer_names, res_names, sem_scores, layer_labels,
+        n_peaks=3,
+        sem_threshold=0.4,
+        save_path=f"{out_dir}/rq1_semantic_peaks.png",
+    )
+
+    # ------------------------------------------------------------------
+    # RQ2-1  Predicted structure vs top geo-head bias (last layer)
+    # ------------------------------------------------------------------
+    plot_structure_vs_top_geo_bias(
+        acts, layer_names, ca_dist, res_names, geo_scores,
+        zoom=min(80, len(res_names)),
+        save_path=f"{out_dir}/rq2_structure_vs_bias.png",
+    )
+
+    # ------------------------------------------------------------------
+    # RQ2-2  Four bias matrices equally spaced through model depth
+    # ------------------------------------------------------------------
+    plot_bias_sampled_layers(
+        acts, layer_names, geo_scores, res_names,
+        zoom=min(80, len(res_names)),
+        n_samples=4,
+        save_path=f"{out_dir}/rq2_bias_sampled.png",
+    )
+
+    print(f"  All figures saved to {out_dir}")
+
+print("\nPipeline complete.")
 """

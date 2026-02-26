@@ -1319,3 +1319,528 @@ def stack_recycling_steps(activations: dict) -> dict:
             else:
                 out[layer_name][comp_name] = tensor_list.unsqueeze(0)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 10. KL permutation analysis
+# ---------------------------------------------------------------------------
+
+def run_kl_analysis(
+    activations: dict,
+    layer_names: list[str],
+    num_trials: int = 5,
+    eps: float = 1e-10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """KL permutation analysis to separate geometric vs semantic attention importance.
+
+    For each layer × head computes:
+
+    - **geo_score**: mean KL(A ‖ A_perm_bias) over random bias permutations.
+      Measures how much the pairwise bias (geometric routing) determines attention.
+    - **sem_score**: mean KL(A ‖ A_perm_content) over random content permutations.
+      Measures how much the QK content (semantic routing) determines attention.
+
+    Parameters
+    ----------
+    activations : dict
+        Single-step activations ``{layer: {'q': tensor, 'k': tensor, 'bias': tensor}}``.
+    layer_names : list[str]
+        Ordered main-pairformer layer names (filtered to ``pairformer_module.*``).
+    num_trials : int
+        Number of random permutation trials per head.  Default 5.
+    eps : float
+        Small constant for log stability.
+
+    Returns
+    -------
+    geo_raw, sem_raw : np.ndarray, shape ``[num_layers, num_heads]``
+        Raw (unnormalised) KL scores.  Normalise by the 95th percentile before
+        comparing across structures or recycling steps.
+    """
+    geo_raw: Optional[np.ndarray] = None
+    sem_raw: Optional[np.ndarray] = None
+
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    for i, name in enumerate(layer_names):
+        data   = activations[name]
+        q_raw  = data["q"].float()
+        k_raw  = data["k"].float()
+        bias   = data["bias"].float()
+
+        B, N, Hidden = q_raw.shape
+
+        # Normalise bias shape to [B, H, N, N]
+        if bias.shape[-1] == N:
+            num_heads = bias.shape[1]
+        else:
+            num_heads = bias.shape[-1]
+            bias = bias.permute(0, 3, 1, 2)
+
+        head_dim = Hidden // num_heads
+        q = q_raw.view(B, N, num_heads, head_dim).transpose(1, 2)  # [B, H, N, D]
+        k = k_raw.view(B, N, num_heads, head_dim).transpose(1, 2)
+
+        if geo_raw is None:
+            geo_raw = np.zeros((len(layer_names), num_heads), dtype=np.float32)
+            sem_raw = np.zeros((len(layer_names), num_heads), dtype=np.float32)
+
+        for h in range(num_heads):
+            q_h = q[0, h]       # [N, D]
+            k_h = k[0, h]       # [N, D]
+            b_h = bias[0, h]    # [N, N]
+
+            content = torch.matmul(q_h, k_h.T) / (head_dim ** 0.5)  # [N, N]
+            A       = torch.softmax(content + b_h, dim=-1)           # [N, N]
+            log_A   = torch.log(A + eps)
+
+            geo_kl = 0.0
+            sem_kl = 0.0
+            for _ in range(num_trials):
+                perm = torch.randperm(N)
+
+                # Geo: permute spatial layout of bias (shuffle residue positions)
+                b_perm  = b_h[perm][:, perm]
+                A_geo   = torch.softmax(content + b_perm, dim=-1)
+                geo_kl += (A * (log_A - torch.log(A_geo + eps))).sum(-1).mean().item()
+
+                # Sem: permute query positions in content (shuffle content routing)
+                c_perm  = content[perm]
+                A_sem   = torch.softmax(c_perm + b_h, dim=-1)
+                sem_kl += (A * (log_A - torch.log(A_sem + eps))).sum(-1).mean().item()
+
+            geo_raw[i, h] = geo_kl / num_trials
+            sem_raw[i, h] = sem_kl / num_trials
+
+    return geo_raw, sem_raw
+
+
+# ---------------------------------------------------------------------------
+# 11. Academic publication plots  (RQ1 & RQ2)
+# ---------------------------------------------------------------------------
+
+_ACADEMIC_RC: dict = {
+    "font.family":        "sans-serif",
+    "font.size":          11,
+    "axes.labelsize":     12,
+    "axes.titlesize":     13,
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "xtick.labelsize":    10,
+    "ytick.labelsize":    10,
+}
+
+
+def _kl_heatmap_ax(
+    ax: "plt.Axes",
+    scores: np.ndarray,
+    layer_labels: list[int],
+    title: str,
+    cmap: str,
+) -> "plt.cm.ScalarMappable":
+    """Draw a single layer×head KL-score heatmap on *ax*.  Returns the image."""
+    num_layers, num_heads = scores.shape
+    im = ax.imshow(scores, cmap=cmap, vmin=0, vmax=1,
+                   aspect="auto", interpolation="nearest")
+    ax.set_xticks(range(num_heads))
+    ax.set_xticklabels([str(h) for h in range(num_heads)], fontsize=9)
+    ax.set_xlabel("Attention head", labelpad=4)
+
+    step = max(1, num_layers // 12)
+    ypos = list(range(0, num_layers, step))
+    ax.set_yticks(ypos)
+    ax.set_yticklabels([str(layer_labels[p]) for p in ypos])
+    ax.set_ylabel("Layer", labelpad=4)
+    ax.set_title(title, pad=8)
+    return im
+
+
+def plot_kl_heatmaps_separate(
+    geo_scores: np.ndarray,
+    sem_scores: np.ndarray,
+    layer_labels: list[int],
+    save_geo: Optional[str] = None,
+    save_sem: Optional[str] = None,
+) -> tuple["plt.Figure", "plt.Figure"]:
+    """Two separate academic heatmaps of normalised geo and sem KL scores.
+
+    Parameters
+    ----------
+    geo_scores, sem_scores : np.ndarray, shape ``[num_layers, num_heads]``
+        Normalised (0–1) KL scores from :func:`run_kl_analysis`.
+    layer_labels : list[int]
+    save_geo, save_sem : str, optional
+
+    Returns
+    -------
+    fig_geo, fig_sem : matplotlib.figure.Figure
+    """
+    num_layers, num_heads = geo_scores.shape
+    figs = []
+
+    configs = [
+        (geo_scores,
+         "Geometric attention importance\n(pairwise-bias KL score)",
+         "viridis", save_geo),
+        (sem_scores,
+         "Semantic attention importance\n(content KL score)",
+         "magma",   save_sem),
+    ]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        for scores, title, cmap, save_path in configs:
+            fig_w = max(5.5, num_heads * 0.5 + 1.5)
+            fig_h = max(4.5, num_layers * 0.17 + 1.5)
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = _kl_heatmap_ax(ax, scores, layer_labels, title, cmap)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+            cbar.set_label("Normalised KL score", fontsize=10)
+            cbar.ax.tick_params(labelsize=9)
+            plt.tight_layout()
+            if save_path:
+                fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.show()
+            figs.append(fig)
+
+    return tuple(figs)
+
+
+def plot_kl_heatmap_combined(
+    geo_scores: np.ndarray,
+    sem_scores: np.ndarray,
+    layer_labels: list[int],
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Side-by-side geo | sem KL heatmap (academic style).
+
+    Parameters
+    ----------
+    geo_scores, sem_scores : np.ndarray, shape ``[num_layers, num_heads]``
+    layer_labels : list[int]
+    save_path : str, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    num_layers, num_heads = geo_scores.shape
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fig_h = max(4.5, num_layers * 0.17 + 1.5)
+        fig_w = max(11, num_heads * 1.0 + 3)
+        fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_h),
+                                 gridspec_kw={"wspace": 0.3})
+
+        for ax, scores, title, cmap in zip(
+            axes,
+            [geo_scores, sem_scores],
+            ["Geometric (bias KL)", "Semantic (content KL)"],
+            ["viridis", "magma"],
+        ):
+            im = _kl_heatmap_ax(ax, scores, layer_labels, title, cmap)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+            cbar.set_label("KL score (norm.)", fontsize=9)
+
+        plt.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig
+
+
+def plot_semantic_peaks(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    sem_scores: np.ndarray,
+    layer_labels: list[int],
+    save_path: Optional[str] = None,
+    n_peaks: int = 3,
+    sem_threshold: float = 0.4,
+) -> plt.Figure:
+    """Identify semantic-attention peaks and show which residue categories they target.
+
+    Layout
+    ------
+    - **Top panel**: mean semantic KL score per layer, with peak layers marked.
+    - **Bottom panels**: for each peak, a bar chart of mean attention received by
+      each amino-acid category (computed from high-sem heads in that layer).
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    res_names : list[str]
+    sem_scores : np.ndarray, shape ``[num_layers, num_heads]``
+    layer_labels : list[int]
+    save_path : str, optional
+    n_peaks : int
+        Number of peaks to detect and show.  Default 3.
+    sem_threshold : float
+        Min normalised sem score for a head to be classified as "high-semantic".
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    num_layers = len(layer_names)
+    layer_mean = sem_scores.mean(axis=1)   # [L]
+
+    # --- Detect peaks ---
+    try:
+        from scipy.signal import find_peaks as _fp
+        peak_idxs, _ = _fp(layer_mean, distance=max(1, num_layers // 10))
+        if len(peak_idxs) >= n_peaks:
+            # Take the top-n by height
+            peak_idxs = peak_idxs[np.argsort(layer_mean[peak_idxs])[::-1][:n_peaks]]
+        else:
+            peak_idxs = np.argsort(layer_mean)[::-1][:n_peaks]
+    except ImportError:
+        peak_idxs = np.argsort(layer_mean)[::-1][:n_peaks]
+
+    peak_idxs = sorted(int(p) for p in peak_idxs)
+
+    # Colours for peaks
+    peak_colors = ["#E07B7B", "#5BA85B", "#7B7BE0"][:n_peaks]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fig = plt.figure(figsize=(4 + 4.5 * n_peaks, 8))
+        gs  = fig.add_gridspec(2, max(n_peaks, 1),
+                               height_ratios=[1.4, 1.6],
+                               hspace=0.5, wspace=0.4)
+
+        # --- Top: line plot ---
+        ax_top = fig.add_subplot(gs[0, :])
+        x = np.arange(num_layers)
+        ax_top.plot(x, layer_mean, lw=1.8, color="#5B8DB8", zorder=3,
+                    label="Mean sem score")
+        ax_top.fill_between(x, 0, layer_mean, alpha=0.12, color="#5B8DB8")
+
+        for k, (pidx, pc) in enumerate(zip(peak_idxs, peak_colors)):
+            ax_top.axvline(pidx, color=pc, lw=1.4, ls="--", alpha=0.85, zorder=2)
+            ax_top.scatter([pidx], [layer_mean[pidx]], color=pc, s=60, zorder=4)
+            ax_top.annotate(
+                f"Peak {k+1}  (L{layer_labels[pidx]})",
+                xy=(pidx, layer_mean[pidx]),
+                xytext=(pidx + 0.8, layer_mean[pidx] + max(layer_mean) * 0.06),
+                fontsize=8.5, color=pc,
+                arrowprops=dict(arrowstyle="-", color=pc, lw=0.8),
+            )
+
+        step = max(1, num_layers // 10)
+        ax_top.set_xticks(range(0, num_layers, step))
+        ax_top.set_xticklabels([str(layer_labels[p]) for p in range(0, num_layers, step)])
+        ax_top.set_xlim(-0.5, num_layers - 0.5)
+        ax_top.set_ylim(bottom=0)
+        ax_top.set_xlabel("Layer")
+        ax_top.set_ylabel("Mean sem KL score")
+        ax_top.set_title(
+            "Semantic attention importance across layers\n"
+            "(peaks = layers with highest content-driven routing)"
+        )
+        ax_top.legend(fontsize=9)
+        ax_top.grid(True, alpha=0.2)
+
+        # --- Bottom: residue category bar chart for each peak ---
+        cats   = list(AA_CATEGORIES.keys()) + ["Unknown"]
+        colors = [_CATEGORY_COLORS[c] for c in cats]
+        xlabels = [c.replace("+", "+\n").replace("-", "-\n") for c in cats]
+
+        for panel_i, (pidx, pc) in enumerate(zip(peak_idxs, peak_colors)):
+            ax = fig.add_subplot(gs[1, panel_i])
+
+            # Identify high-sem heads for this layer
+            layer_sem  = sem_scores[pidx]
+            high_heads = list(np.where(layer_sem >= sem_threshold)[0])
+            if not high_heads:
+                high_heads = [int(np.argmax(layer_sem))]
+
+            data      = activations[layer_names[pidx]]
+            attn_maps, _ = _get_attention_maps(data, "content")
+            N = min(attn_maps.shape[-1], len(res_names))
+
+            # Attention received by each category
+            cat_attn: dict[str, list[float]] = {}
+            for h in high_heads:
+                per_pos = attn_maps[h, :N, :N].mean(axis=0)
+                for j, res in enumerate(res_names[:N]):
+                    cat = AA_TO_CATEGORY.get(res, "Unknown")
+                    cat_attn.setdefault(cat, []).append(float(per_pos[j]))
+
+            means = [np.mean(cat_attn.get(c, [0.0])) for c in cats]
+            bars  = ax.bar(range(len(cats)), means, color=colors,
+                           edgecolor="white", linewidth=0.6)
+            # Highlight the peak bar outline
+            ax.spines["bottom"].set_color(pc)
+            ax.spines["left"].set_color(pc)
+
+            ax.set_xticks(range(len(cats)))
+            ax.set_xticklabels(xlabels, fontsize=8, rotation=40, ha="right")
+            ax.set_ylabel("Mean attention", fontsize=9)
+            ax.set_title(
+                f"Peak {panel_i+1} — Layer {layer_labels[pidx]}\n"
+                f"({len(high_heads)} high-sem head{'s' if len(high_heads) > 1 else ''})",
+                fontsize=10, color=pc,
+            )
+            ax.grid(axis="y", alpha=0.2)
+            for bar, val in zip(bars, means):
+                if val > 0.0005:
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            val + max(means) * 0.015,
+                            f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig
+
+
+def plot_structure_vs_top_geo_bias(
+    activations: dict,
+    layer_names: list[str],
+    ca_dist: np.ndarray,
+    res_names: list[str],
+    geo_scores: np.ndarray,
+    save_path: Optional[str] = None,
+    zoom: int = 80,
+) -> plt.Figure:
+    """Predicted-structure proximity vs the top geometric head's bias matrix.
+
+    The diagonal is masked (set to NaN) to prevent it from dominating the colour
+    scale.  The highest geometric head is taken from the **last** pairformer layer.
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    ca_dist : np.ndarray, shape ``[N, N]``
+    res_names : list[str]
+    geo_scores : np.ndarray, shape ``[num_layers, num_heads]``
+    save_path : str, optional
+    zoom : int
+        Crop matrices to first *zoom* residues for readability.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    last_idx  = len(layer_names) - 1
+    best_head = int(np.argmax(geo_scores[last_idx]))
+    best_geo  = float(geo_scores[last_idx, best_head])
+    layer_depth = _layer_idx_from_name(layer_names[last_idx])
+
+    attn_maps, _ = _get_attention_maps(activations[layer_names[last_idx]], "bias")
+    N = min(attn_maps.shape[-1], len(res_names), zoom, ca_dist.shape[0])
+
+    bias_mat = attn_maps[best_head, :N, :N].copy().astype(float)
+    prox_mat = (1.0 / (ca_dist[:N, :N] + 1.0)).astype(float)
+
+    # Mask diagonal so it doesn't anchor the colourscale
+    np.fill_diagonal(bias_mat, np.nan)
+    np.fill_diagonal(prox_mat, np.nan)
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5),
+                                 gridspec_kw={"wspace": 0.32})
+
+        panels = [
+            (prox_mat, "Predicted structure\n(Cα proximity  1/(d+1))", "YlOrRd"),
+            (bias_mat,
+             f"Pairwise-bias attention\n(layer {layer_depth}, head {best_head}, geo={best_geo:.2f})",
+             "viridis"),
+        ]
+        for ax, (mat, title, cmap) in zip(axes, panels):
+            im = ax.imshow(mat, cmap=cmap, aspect="auto", interpolation="nearest")
+            ax.set_xlabel("Residue index")
+            ax.set_ylabel("Residue index")
+            ax.set_title(title, pad=8)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=9)
+
+        fig.suptitle(
+            "Predicted 3-D structure vs geometric attention  (diagonal masked)",
+            fontsize=13, weight="bold", y=1.02,
+        )
+        plt.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig
+
+
+def plot_bias_sampled_layers(
+    activations: dict,
+    layer_names: list[str],
+    geo_scores: np.ndarray,
+    res_names: list[str],
+    save_path: Optional[str] = None,
+    zoom: int = 80,
+    n_samples: int = 4,
+) -> plt.Figure:
+    """Bias attention matrices for the top geometric head in *n_samples* evenly-spaced layers.
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    geo_scores : np.ndarray, shape ``[num_layers, num_heads]``
+    res_names : list[str]
+    save_path : str, optional
+    zoom : int
+        Crop to the first *zoom* residues.
+    n_samples : int
+        Number of layers to sample.  Default 4.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    num_layers = len(layer_names)
+    if n_samples == 1:
+        sample_idxs = [num_layers - 1]
+    else:
+        sample_idxs = [
+            int(round(i * (num_layers - 1) / (n_samples - 1)))
+            for i in range(n_samples)
+        ]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fig, axes = plt.subplots(1, n_samples,
+                                 figsize=(4.5 * n_samples, 5),
+                                 gridspec_kw={"wspace": 0.3})
+        if n_samples == 1:
+            axes = [axes]
+
+        for ax, lidx in zip(axes, sample_idxs):
+            best_head   = int(np.argmax(geo_scores[lidx]))
+            geo_val     = float(geo_scores[lidx, best_head])
+            layer_depth = _layer_idx_from_name(layer_names[lidx])
+
+            attn_maps, _ = _get_attention_maps(activations[layer_names[lidx]], "bias")
+            N   = min(attn_maps.shape[-1], len(res_names), zoom)
+            mat = attn_maps[best_head, :N, :N]
+
+            im = ax.imshow(mat, cmap="viridis", aspect="auto",
+                           interpolation="nearest", vmin=0)
+            ax.set_title(
+                f"Layer {layer_depth}\nHead {best_head}  (geo={geo_val:.2f})",
+                pad=8, fontsize=11,
+            )
+            ax.set_xlabel("Residue")
+            ax.set_ylabel("Residue")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=8)
+
+        fig.suptitle(
+            "Geometric attention — top geo head per sampled layer",
+            fontsize=13, weight="bold",
+        )
+        plt.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig
