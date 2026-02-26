@@ -1466,6 +1466,7 @@ def plot_kl_heatmaps_separate(
     layer_labels: list[int],
     save_geo: Optional[str] = None,
     save_sem: Optional[str] = None,
+    figsize: Optional[tuple[float, float]] = None,
 ) -> tuple["plt.Figure", "plt.Figure"]:
     """Two separate academic heatmaps of normalised geo and sem KL scores.
 
@@ -1475,6 +1476,8 @@ def plot_kl_heatmaps_separate(
         Normalised (0–1) KL scores from :func:`run_kl_analysis`.
     layer_labels : list[int]
     save_geo, save_sem : str, optional
+    figsize : (width, height) in inches, optional
+        Override the auto-computed figure size for both panels.
 
     Returns
     -------
@@ -1494,9 +1497,12 @@ def plot_kl_heatmaps_separate(
 
     with plt.rc_context(_ACADEMIC_RC):
         for scores, title, cmap, save_path in configs:
-            fig_w = max(5.5, num_heads * 0.5 + 1.5)
-            fig_h = max(4.5, num_layers * 0.17 + 1.5)
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            if figsize is not None:
+                fs = figsize
+            else:
+                fs = (max(5.5, num_heads * 0.5 + 1.5),
+                      max(4.5, num_layers * 0.17 + 1.5))
+            fig, ax = plt.subplots(figsize=fs)
             im = _kl_heatmap_ax(ax, scores, layer_labels, title, cmap)
             cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
             cbar.set_label("Normalised KL score", fontsize=10)
@@ -1515,6 +1521,7 @@ def plot_kl_heatmap_combined(
     sem_scores: np.ndarray,
     layer_labels: list[int],
     save_path: Optional[str] = None,
+    figsize: Optional[tuple[float, float]] = None,
 ) -> plt.Figure:
     """Side-by-side geo | sem KL heatmap (academic style).
 
@@ -1523,6 +1530,8 @@ def plot_kl_heatmap_combined(
     geo_scores, sem_scores : np.ndarray, shape ``[num_layers, num_heads]``
     layer_labels : list[int]
     save_path : str, optional
+    figsize : (width, height) in inches, optional
+        Override the auto-computed figure size.
 
     Returns
     -------
@@ -1531,9 +1540,12 @@ def plot_kl_heatmap_combined(
     num_layers, num_heads = geo_scores.shape
 
     with plt.rc_context(_ACADEMIC_RC):
-        fig_h = max(4.5, num_layers * 0.17 + 1.5)
-        fig_w = max(11, num_heads * 1.0 + 3)
-        fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_h),
+        if figsize is not None:
+            fs = figsize
+        else:
+            fs = (max(11, num_heads * 1.0 + 3),
+                  max(4.5, num_layers * 0.17 + 1.5))
+        fig, axes = plt.subplots(1, 2, figsize=fs,
                                  gridspec_kw={"wspace": 0.3})
 
         for ax, scores, title, cmap in zip(
@@ -1563,6 +1575,7 @@ def plot_semantic_peaks(
     save_path: Optional[str] = None,
     n_peaks: int = 3,
     sem_threshold: float = 0.4,
+    figsize: Optional[tuple[float, float]] = None,
 ) -> plt.Figure:
     """Identify semantic-attention peaks and show which residue categories they target.
 
@@ -1584,6 +1597,8 @@ def plot_semantic_peaks(
         Number of peaks to detect and show.  Default 3.
     sem_threshold : float
         Min normalised sem score for a head to be classified as "high-semantic".
+    figsize : (width, height) in inches, optional
+        Override the auto-computed figure size.
 
     Returns
     -------
@@ -1610,7 +1625,8 @@ def plot_semantic_peaks(
     peak_colors = ["#E07B7B", "#5BA85B", "#7B7BE0"][:n_peaks]
 
     with plt.rc_context(_ACADEMIC_RC):
-        fig = plt.figure(figsize=(4 + 4.5 * n_peaks, 8))
+        fs  = figsize if figsize is not None else (4 + 4.5 * n_peaks, 8)
+        fig = plt.figure(figsize=fs)
         gs  = fig.add_gridspec(2, max(n_peaks, 1),
                                height_ratios=[1.4, 1.6],
                                hspace=0.5, wspace=0.4)
@@ -1621,17 +1637,6 @@ def plot_semantic_peaks(
         ax_top.plot(x, layer_mean, lw=1.8, color="#5B8DB8", zorder=3,
                     label="Mean sem score")
         ax_top.fill_between(x, 0, layer_mean, alpha=0.12, color="#5B8DB8")
-
-        for k, (pidx, pc) in enumerate(zip(peak_idxs, peak_colors)):
-            ax_top.axvline(pidx, color=pc, lw=1.4, ls="--", alpha=0.85, zorder=2)
-            ax_top.scatter([pidx], [layer_mean[pidx]], color=pc, s=60, zorder=4)
-            ax_top.annotate(
-                f"Peak {k+1}  (L{layer_labels[pidx]})",
-                xy=(pidx, layer_mean[pidx]),
-                xytext=(pidx + 0.8, layer_mean[pidx] + max(layer_mean) * 0.06),
-                fontsize=8.5, color=pc,
-                arrowprops=dict(arrowstyle="-", color=pc, lw=0.8),
-            )
 
         step = max(1, num_layers // 10)
         ax_top.set_xticks(range(0, num_layers, step))
@@ -1710,6 +1715,7 @@ def plot_structure_vs_top_geo_bias(
     geo_scores: np.ndarray,
     save_path: Optional[str] = None,
     zoom: int = 80,
+    figsize: Optional[tuple[float, float]] = None,
 ) -> plt.Figure:
     """Predicted-structure proximity vs the top geometric head's bias matrix.
 
@@ -1726,6 +1732,8 @@ def plot_structure_vs_top_geo_bias(
     save_path : str, optional
     zoom : int
         Crop matrices to first *zoom* residues for readability.
+    figsize : (width, height) in inches, optional
+        Override the default ``(13, 5.5)``.
 
     Returns
     -------
@@ -1747,7 +1755,8 @@ def plot_structure_vs_top_geo_bias(
     np.fill_diagonal(prox_mat, np.nan)
 
     with plt.rc_context(_ACADEMIC_RC):
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5),
+        fs = figsize if figsize is not None else (13, 5.5)
+        fig, axes = plt.subplots(1, 2, figsize=fs,
                                  gridspec_kw={"wspace": 0.32})
 
         panels = [
@@ -1784,6 +1793,7 @@ def plot_bias_sampled_layers(
     save_path: Optional[str] = None,
     zoom: int = 80,
     n_samples: int = 4,
+    figsize: Optional[tuple[float, float]] = None,
 ) -> plt.Figure:
     """Bias attention matrices for the top geometric head in *n_samples* evenly-spaced layers.
 
@@ -1798,6 +1808,8 @@ def plot_bias_sampled_layers(
         Crop to the first *zoom* residues.
     n_samples : int
         Number of layers to sample.  Default 4.
+    figsize : (width, height) in inches, optional
+        Override the default ``(4.5 * n_samples, 5)``.
 
     Returns
     -------
@@ -1813,8 +1825,9 @@ def plot_bias_sampled_layers(
         ]
 
     with plt.rc_context(_ACADEMIC_RC):
+        fs = figsize if figsize is not None else (4.5 * n_samples, 5)
         fig, axes = plt.subplots(1, n_samples,
-                                 figsize=(4.5 * n_samples, 5),
+                                 figsize=fs,
                                  gridspec_kw={"wspace": 0.3})
         if n_samples == 1:
             axes = [axes]

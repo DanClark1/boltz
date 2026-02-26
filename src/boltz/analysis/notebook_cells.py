@@ -425,12 +425,26 @@ for example in EXAMPLES:
     print(f"  geo mean={geo_scores.mean():.3f}  sem mean={sem_scores.mean():.3f}")
 
     # ------------------------------------------------------------------
+    # Figure sizes — tweak (width, height) in inches per figure.
+    # Set any entry to None to use automatic sizing.
+    # ------------------------------------------------------------------
+    FIG_SIZES = {
+        "rq1_geo":      None,          # e.g. (8, 10)
+        "rq1_sem":      None,
+        "rq1_combined": None,
+        "rq1_peaks":    None,          # e.g. (18, 9)
+        "rq2_struct":   None,          # e.g. (14, 6)
+        "rq2_sampled":  None,          # e.g. (20, 5)
+    }
+
+    # ------------------------------------------------------------------
     # RQ1-1  Separate academic heatmaps (geo / sem)
     # ------------------------------------------------------------------
     plot_kl_heatmaps_separate(
         geo_scores, sem_scores, layer_labels,
         save_geo=f"{out_dir}/rq1_geo_heatmap.png",
         save_sem=f"{out_dir}/rq1_sem_heatmap.png",
+        figsize=FIG_SIZES["rq1_geo"],   # applies to both panels
     )
 
     # ------------------------------------------------------------------
@@ -439,6 +453,7 @@ for example in EXAMPLES:
     plot_kl_heatmap_combined(
         geo_scores, sem_scores, layer_labels,
         save_path=f"{out_dir}/rq1_combined_heatmap.png",
+        figsize=FIG_SIZES["rq1_combined"],
     )
 
     # ------------------------------------------------------------------
@@ -449,6 +464,7 @@ for example in EXAMPLES:
         n_peaks=3,
         sem_threshold=0.4,
         save_path=f"{out_dir}/rq1_semantic_peaks.png",
+        figsize=FIG_SIZES["rq1_peaks"],
     )
 
     # ------------------------------------------------------------------
@@ -458,6 +474,7 @@ for example in EXAMPLES:
         acts, layer_names, ca_dist, res_names, geo_scores,
         zoom=min(80, len(res_names)),
         save_path=f"{out_dir}/rq2_structure_vs_bias.png",
+        figsize=FIG_SIZES["rq2_struct"],
     )
 
     # ------------------------------------------------------------------
@@ -468,6 +485,7 @@ for example in EXAMPLES:
         zoom=min(80, len(res_names)),
         n_samples=4,
         save_path=f"{out_dir}/rq2_bias_sampled.png",
+        figsize=FIG_SIZES["rq2_sampled"],
     )
 
     print(f"  All figures saved to {out_dir}")
