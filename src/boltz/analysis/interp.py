@@ -1158,3 +1158,158 @@ def plot_top_residue_type_heatmap(
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# 8. Per-layer attention matrix export
+# ---------------------------------------------------------------------------
+
+def export_layer_attention_matrices(
+    activations: dict,
+    layer_names: list[str],
+    out_dir: str,
+    zoom: int = 80,
+    dpi: int = 120,
+    zip_output: bool = True,
+) -> None:
+    """Save one figure per layer showing full / bias / content attention for every head.
+
+    Layout: 3 rows (Full | Bias | Content) × num_heads columns.  Each cell
+    is a heatmap of the softmaxed attention matrix cropped to the first *zoom*
+    residues.
+
+    Parameters
+    ----------
+    activations : dict
+        Captured activations dict, or the output of :func:`get_recycling_step`.
+    layer_names : list[str]
+        Ordered layer names (e.g. from ``layer_names.sort(key=get_layer_idx)``).
+    out_dir : str
+        Folder to write the per-layer PNG files into (created if absent).
+    zoom : int
+        Crop heatmaps to the first *zoom* residues for legibility.  Default 80.
+    dpi : int
+        Figure DPI.  Default 120.
+    zip_output : bool
+        If ``True`` (default), also create ``<out_dir>.zip`` for easy download.
+    """
+    import shutil
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    components = [
+        ("full",    "Full Attention\n(Bias + Content)", "viridis"),
+        ("bias",    "Bias Attention\n(Geometric)",      "cividis"),
+        ("content", "Content Attention\n(Semantic QK)", "magma"),
+    ]
+
+    for name in layer_names:
+        layer_idx = _layer_idx_from_name(name)
+
+        maps = {}
+        num_heads = None
+        for comp, _, _ in components:
+            m, nh = _get_attention_maps(activations[name], comp)
+            maps[comp] = m
+            num_heads = nh
+
+        N = min(maps["full"].shape[-1], zoom)
+
+        # Layout: 3 rows (components) × num_heads columns
+        fig_w = max(12, 2.2 * num_heads)
+        fig, axes = plt.subplots(3, num_heads, figsize=(fig_w, 9),
+                                 gridspec_kw={"hspace": 0.08, "wspace": 0.04})
+
+        fig.suptitle(f"Layer {layer_idx} — Attention Matrices  (zoom={zoom})",
+                     fontsize=13, weight="bold", y=1.01)
+
+        for row, (comp, row_label, cmap_name) in enumerate(components):
+            for h in range(num_heads):
+                ax = axes[row, h]
+                data = maps[comp][h, :N, :N]
+                ax.imshow(data, cmap=cmap_name, vmin=0, vmax=1,
+                          aspect="auto", interpolation="nearest")
+                ax.set_xticks([]); ax.set_yticks([])
+
+                if row == 0:
+                    ax.set_title(f"H{h}", fontsize=8)
+                if h == 0:
+                    ax.set_ylabel(row_label, fontsize=8, labelpad=4)
+
+        file_path = out_path / f"Layer_{layer_idx:02d}_attention.png"
+        plt.savefig(file_path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved Layer {layer_idx:2d} → {file_path.name}")
+
+    if zip_output:
+        zip_path = str(out_path.parent / out_path.name)
+        shutil.make_archive(zip_path, "zip", out_path)
+        print(f"\nZipped → {zip_path}.zip")
+
+
+# ---------------------------------------------------------------------------
+# 9. Recycling-step utilities
+# ---------------------------------------------------------------------------
+
+def get_recycling_step(
+    activations: dict,
+    step: int = -1,
+) -> dict:
+    """Extract activations for one recycling step from a multi-step capture.
+
+    When hooks are set up with the recycling-aware pattern (list-appending),
+    each ``activations[layer][component]`` is a list of tensors, one per
+    recycling step.  This helper returns a standard single-step dict compatible
+    with all other analysis functions.
+
+    Parameters
+    ----------
+    activations : dict
+        Multi-step activations captured with the list-appending hook pattern.
+    step : int
+        Which step to extract.  ``-1`` (default) = final step,  ``0`` = first
+        step (before any recycling), etc.
+
+    Returns
+    -------
+    dict
+        Single-step activations in the standard ``{layer: {component: tensor}}``
+        format expected by all other functions in this module.
+    """
+    out: dict = {}
+    for layer_name, components in activations.items():
+        out[layer_name] = {}
+        for comp_name, tensor_list in components.items():
+            if isinstance(tensor_list, list):
+                out[layer_name][comp_name] = tensor_list[step]
+            else:
+                out[layer_name][comp_name] = tensor_list
+    return out
+
+
+def stack_recycling_steps(activations: dict) -> dict:
+    """Stack all recycling steps into a single tensor along a new leading dim.
+
+    Returns ``{layer: {component: tensor}}`` where each tensor has shape
+    ``[num_steps, ...]`` so you can index/slice across steps.
+
+    Parameters
+    ----------
+    activations : dict
+        Multi-step activations captured with the list-appending hook pattern.
+
+    Returns
+    -------
+    dict
+        ``{layer: {component: stacked_tensor}}``
+    """
+    out: dict = {}
+    for layer_name, components in activations.items():
+        out[layer_name] = {}
+        for comp_name, tensor_list in components.items():
+            if isinstance(tensor_list, list):
+                out[layer_name][comp_name] = torch.stack(tensor_list, dim=0)
+            else:
+                out[layer_name][comp_name] = tensor_list.unsqueeze(0)
+    return out
