@@ -1282,7 +1282,13 @@ def get_recycling_step(
         out[layer_name] = {}
         for comp_name, tensor_list in components.items():
             if isinstance(tensor_list, list):
-                out[layer_name][comp_name] = tensor_list[step]
+                # Clamp to the last available step — confidence module layers
+                # are only called once (not in the recycling loop) so their
+                # lists are shorter than the main pairformer layers.
+                n = len(tensor_list)
+                actual = step if step >= 0 else n + step
+                actual = max(0, min(actual, n - 1))
+                out[layer_name][comp_name] = tensor_list[actual]
             else:
                 out[layer_name][comp_name] = tensor_list
     return out
