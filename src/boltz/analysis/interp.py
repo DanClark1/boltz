@@ -1716,6 +1716,157 @@ def plot_semantic_peaks(
     return fig_line, fig_bars
 
 
+def plot_geometric_peaks(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    geo_scores: np.ndarray,
+    layer_labels: list[int],
+    save_path_line: Optional[str] = None,
+    save_path_bars: Optional[str] = None,
+    n_peaks: int = 3,
+    geo_threshold: float = 0.4,
+    figsize_line: Optional[tuple[float, float]] = None,
+    figsize_bars: Optional[tuple[float, float]] = None,
+) -> tuple[plt.Figure, plt.Figure]:
+    """Identify geometric-attention peaks and show which residue categories they target.
+
+    Mirror of :func:`plot_semantic_peaks` but driven by ``geo_scores`` and the
+    pairwise-bias attention component.
+
+    Produces two independent figures:
+
+    - **Line figure**: mean geometric KL score per layer.
+    - **Bars figure**: for each peak, a bar chart of mean bias-attention received
+      by each amino-acid category (computed from high-geo heads in that layer).
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    res_names : list[str]
+    geo_scores : np.ndarray, shape ``[num_layers, num_heads]``
+    layer_labels : list[int]
+    save_path_line : str, optional
+    save_path_bars : str, optional
+    n_peaks : int
+        Number of peaks to detect and show.  Default 3.
+    geo_threshold : float
+        Min normalised geo score for a head to be classified as "high-geometric".
+    figsize_line : (width, height) in inches, optional
+    figsize_bars : (width, height) in inches, optional
+
+    Returns
+    -------
+    fig_line, fig_bars : matplotlib.figure.Figure
+    """
+    num_layers = len(layer_names)
+    layer_mean = geo_scores.mean(axis=1)   # [L]
+
+    # --- Detect peaks ---
+    try:
+        from scipy.signal import find_peaks as _fp
+        peak_idxs, _ = _fp(layer_mean, distance=max(1, num_layers // 10))
+        if len(peak_idxs) >= n_peaks:
+            peak_idxs = peak_idxs[np.argsort(layer_mean[peak_idxs])[::-1][:n_peaks]]
+        else:
+            peak_idxs = np.argsort(layer_mean)[::-1][:n_peaks]
+    except ImportError:
+        peak_idxs = np.argsort(layer_mean)[::-1][:n_peaks]
+
+    peak_idxs = sorted(int(p) for p in peak_idxs)
+    peak_colors = ["#E07B7B", "#5BA85B", "#7B7BE0"][:n_peaks]
+
+    with plt.rc_context(_ACADEMIC_RC):
+
+        # ── Figure 1: line plot ──────────────────────────────────────────
+        fs_line = figsize_line if figsize_line is not None else (8, 3.5)
+        fig_line, ax_top = plt.subplots(figsize=fs_line)
+
+        x = np.arange(num_layers)
+        ax_top.plot(x, layer_mean, lw=1.8, color="#C05A2A", zorder=3,
+                    label="Mean geo score")
+        ax_top.fill_between(x, 0, layer_mean, alpha=0.12, color="#C05A2A")
+
+        step = max(1, num_layers // 10)
+        ax_top.set_xticks(range(0, num_layers, step))
+        ax_top.set_xticklabels([str(layer_labels[p]) for p in range(0, num_layers, step)])
+        ax_top.set_xlim(-0.5, num_layers - 0.5)
+        ax_top.set_ylim(bottom=0)
+        ax_top.set_xlabel("Layer")
+        ax_top.set_ylabel("Mean geo KL score")
+        ax_top.set_title(
+            "Geometric attention importance across layers\n"
+            "(peaks = layers with highest bias-driven routing)"
+        )
+        ax_top.legend(fontsize=9)
+        ax_top.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_path_line:
+            fig_line.savefig(save_path_line, dpi=150, bbox_inches="tight")
+        plt.show()
+
+        # ── Figure 2: residue-category bar charts ────────────────────────
+        cats    = list(AA_CATEGORIES.keys()) + ["Unknown"]
+        colors  = [_CATEGORY_COLORS[c] for c in cats]
+        xlabels = [c.replace("+", "+\n").replace("-", "-\n") for c in cats]
+
+        fs_bars = figsize_bars if figsize_bars is not None else (4.5 * n_peaks, 4)
+        fig_bars, axes_bars = plt.subplots(
+            1, n_peaks, figsize=fs_bars,
+            gridspec_kw={"wspace": 0.4},
+        )
+        if n_peaks == 1:
+            axes_bars = [axes_bars]
+
+        for panel_i, (pidx, pc) in enumerate(zip(peak_idxs, peak_colors)):
+            ax = axes_bars[panel_i]
+
+            layer_geo  = geo_scores[pidx]
+            high_heads = list(np.where(layer_geo >= geo_threshold)[0])
+            if not high_heads:
+                high_heads = [int(np.argmax(layer_geo))]
+
+            data         = activations[layer_names[pidx]]
+            attn_maps, _ = _get_attention_maps(data, "bias")
+            N = min(attn_maps.shape[-1], len(res_names))
+
+            cat_attn: dict[str, list[float]] = {}
+            for h in high_heads:
+                per_pos = attn_maps[h, :N, :N].mean(axis=0)
+                for j, res in enumerate(res_names[:N]):
+                    cat = AA_TO_CATEGORY.get(res, "Unknown")
+                    cat_attn.setdefault(cat, []).append(float(per_pos[j]))
+
+            means = [np.mean(cat_attn.get(c, [0.0])) for c in cats]
+            bars  = ax.bar(range(len(cats)), means, color=colors,
+                           edgecolor="white", linewidth=0.6)
+            ax.spines["bottom"].set_color(pc)
+            ax.spines["left"].set_color(pc)
+
+            ax.set_xticks(range(len(cats)))
+            ax.set_xticklabels(xlabels, fontsize=8, rotation=40, ha="right")
+            ax.set_ylabel("Mean attention", fontsize=9)
+            ax.set_title(
+                f"Peak {panel_i+1} — Layer {layer_labels[pidx]}\n"
+                f"({len(high_heads)} high-geo head{'s' if len(high_heads) > 1 else ''})",
+                fontsize=10, color=pc,
+            )
+            ax.grid(axis="y", alpha=0.2)
+            for bar, val in zip(bars, means):
+                if val > 0.0005:
+                    ax.text(bar.get_x() + bar.get_width() / 2,
+                            val + max(means) * 0.015,
+                            f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+
+        plt.tight_layout()
+        if save_path_bars:
+            fig_bars.savefig(save_path_bars, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig_line, fig_bars
+
+
 def plot_structure_vs_top_geo_bias(
     activations: dict,
     layer_names: list[str],

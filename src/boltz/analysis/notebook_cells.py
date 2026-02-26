@@ -369,6 +369,7 @@ from boltz.analysis.interp import (
     plot_kl_heatmaps_separate,
     plot_kl_heatmap_combined,
     plot_semantic_peaks,
+    plot_geometric_peaks,
     plot_structure_vs_top_geo_bias,
     plot_bias_sampled_layers,
 )
@@ -432,8 +433,10 @@ for example in EXAMPLES:
         "rq1_geo":        None,        # e.g. (8, 10)
         "rq1_sem":        None,
         "rq1_combined":   None,
-        "rq1_peaks_line": None,        # e.g. (10, 4)
-        "rq1_peaks_bars": None,        # e.g. (14, 4)
+        "rq1_sem_peaks_line": None,    # e.g. (10, 4)
+        "rq1_sem_peaks_bars": None,    # e.g. (14, 4)
+        "rq1_geo_peaks_line": None,    # e.g. (10, 4)
+        "rq1_geo_peaks_bars": None,    # e.g. (14, 4)
         "rq2_struct":     None,        # e.g. (14, 6)
         "rq2_sampled":    None,        # e.g. (20, 5)
     }
@@ -466,8 +469,18 @@ for example in EXAMPLES:
         sem_threshold=0.4,
         save_path_line=f"{out_dir}/rq1_semantic_peaks_line.png",
         save_path_bars=f"{out_dir}/rq1_semantic_peaks_bars.png",
-        figsize_line=FIG_SIZES["rq1_peaks_line"],
-        figsize_bars=FIG_SIZES["rq1_peaks_bars"],
+        figsize_line=FIG_SIZES["rq1_sem_peaks_line"],
+        figsize_bars=FIG_SIZES["rq1_sem_peaks_bars"],
+    )
+
+    plot_geometric_peaks(
+        acts, layer_names, res_names, geo_scores, layer_labels,
+        n_peaks=3,
+        geo_threshold=0.4,
+        save_path_line=f"{out_dir}/rq1_geometric_peaks_line.png",
+        save_path_bars=f"{out_dir}/rq1_geometric_peaks_bars.png",
+        figsize_line=FIG_SIZES["rq1_geo_peaks_line"],
+        figsize_bars=FIG_SIZES["rq1_geo_peaks_bars"],
     )
 
     # ------------------------------------------------------------------
