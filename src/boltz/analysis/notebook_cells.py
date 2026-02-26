@@ -429,12 +429,13 @@ for example in EXAMPLES:
     # Set any entry to None to use automatic sizing.
     # ------------------------------------------------------------------
     FIG_SIZES = {
-        "rq1_geo":      None,          # e.g. (8, 10)
-        "rq1_sem":      None,
-        "rq1_combined": None,
-        "rq1_peaks":    None,          # e.g. (18, 9)
-        "rq2_struct":   None,          # e.g. (14, 6)
-        "rq2_sampled":  None,          # e.g. (20, 5)
+        "rq1_geo":        None,        # e.g. (8, 10)
+        "rq1_sem":        None,
+        "rq1_combined":   None,
+        "rq1_peaks_line": None,        # e.g. (10, 4)
+        "rq1_peaks_bars": None,        # e.g. (14, 4)
+        "rq2_struct":     None,        # e.g. (14, 6)
+        "rq2_sampled":    None,        # e.g. (20, 5)
     }
 
     # ------------------------------------------------------------------
@@ -463,8 +464,10 @@ for example in EXAMPLES:
         acts, layer_names, res_names, sem_scores, layer_labels,
         n_peaks=3,
         sem_threshold=0.4,
-        save_path=f"{out_dir}/rq1_semantic_peaks.png",
-        figsize=FIG_SIZES["rq1_peaks"],
+        save_path_line=f"{out_dir}/rq1_semantic_peaks_line.png",
+        save_path_bars=f"{out_dir}/rq1_semantic_peaks_bars.png",
+        figsize_line=FIG_SIZES["rq1_peaks_line"],
+        figsize_bars=FIG_SIZES["rq1_peaks_bars"],
     )
 
     # ------------------------------------------------------------------

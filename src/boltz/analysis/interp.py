@@ -1572,17 +1572,19 @@ def plot_semantic_peaks(
     res_names: list[str],
     sem_scores: np.ndarray,
     layer_labels: list[int],
-    save_path: Optional[str] = None,
+    save_path_line: Optional[str] = None,
+    save_path_bars: Optional[str] = None,
     n_peaks: int = 3,
     sem_threshold: float = 0.4,
-    figsize: Optional[tuple[float, float]] = None,
-) -> plt.Figure:
+    figsize_line: Optional[tuple[float, float]] = None,
+    figsize_bars: Optional[tuple[float, float]] = None,
+) -> tuple[plt.Figure, plt.Figure]:
     """Identify semantic-attention peaks and show which residue categories they target.
 
-    Layout
-    ------
-    - **Top panel**: mean semantic KL score per layer, with peak layers marked.
-    - **Bottom panels**: for each peak, a bar chart of mean attention received by
+    Produces two independent figures:
+
+    - **Line figure**: mean semantic KL score per layer.
+    - **Bars figure**: for each peak, a bar chart of mean attention received by
       each amino-acid category (computed from high-sem heads in that layer).
 
     Parameters
@@ -1592,17 +1594,20 @@ def plot_semantic_peaks(
     res_names : list[str]
     sem_scores : np.ndarray, shape ``[num_layers, num_heads]``
     layer_labels : list[int]
-    save_path : str, optional
+    save_path_line : str, optional
+    save_path_bars : str, optional
     n_peaks : int
         Number of peaks to detect and show.  Default 3.
     sem_threshold : float
         Min normalised sem score for a head to be classified as "high-semantic".
-    figsize : (width, height) in inches, optional
-        Override the auto-computed figure size.
+    figsize_line : (width, height) in inches, optional
+        Override the default line-plot figure size.
+    figsize_bars : (width, height) in inches, optional
+        Override the default bar-charts figure size.
 
     Returns
     -------
-    fig : matplotlib.figure.Figure
+    fig_line, fig_bars : matplotlib.figure.Figure
     """
     num_layers = len(layer_names)
     layer_mean = sem_scores.mean(axis=1)   # [L]
@@ -1612,7 +1617,6 @@ def plot_semantic_peaks(
         from scipy.signal import find_peaks as _fp
         peak_idxs, _ = _fp(layer_mean, distance=max(1, num_layers // 10))
         if len(peak_idxs) >= n_peaks:
-            # Take the top-n by height
             peak_idxs = peak_idxs[np.argsort(layer_mean[peak_idxs])[::-1][:n_peaks]]
         else:
             peak_idxs = np.argsort(layer_mean)[::-1][:n_peaks]
@@ -1620,19 +1624,14 @@ def plot_semantic_peaks(
         peak_idxs = np.argsort(layer_mean)[::-1][:n_peaks]
 
     peak_idxs = sorted(int(p) for p in peak_idxs)
-
-    # Colours for peaks
     peak_colors = ["#E07B7B", "#5BA85B", "#7B7BE0"][:n_peaks]
 
     with plt.rc_context(_ACADEMIC_RC):
-        fs  = figsize if figsize is not None else (4 + 4.5 * n_peaks, 8)
-        fig = plt.figure(figsize=fs)
-        gs  = fig.add_gridspec(2, max(n_peaks, 1),
-                               height_ratios=[1.4, 1.6],
-                               hspace=0.5, wspace=0.4)
 
-        # --- Top: line plot ---
-        ax_top = fig.add_subplot(gs[0, :])
+        # ── Figure 1: line plot ──────────────────────────────────────────
+        fs_line = figsize_line if figsize_line is not None else (8, 3.5)
+        fig_line, ax_top = plt.subplots(figsize=fs_line)
+
         x = np.arange(num_layers)
         ax_top.plot(x, layer_mean, lw=1.8, color="#5B8DB8", zorder=3,
                     label="Mean sem score")
@@ -1651,26 +1650,36 @@ def plot_semantic_peaks(
         )
         ax_top.legend(fontsize=9)
         ax_top.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_path_line:
+            fig_line.savefig(save_path_line, dpi=150, bbox_inches="tight")
+        plt.show()
 
-        # --- Bottom: residue category bar chart for each peak ---
-        cats   = list(AA_CATEGORIES.keys()) + ["Unknown"]
-        colors = [_CATEGORY_COLORS[c] for c in cats]
+        # ── Figure 2: residue-category bar charts ────────────────────────
+        cats    = list(AA_CATEGORIES.keys()) + ["Unknown"]
+        colors  = [_CATEGORY_COLORS[c] for c in cats]
         xlabels = [c.replace("+", "+\n").replace("-", "-\n") for c in cats]
 
-        for panel_i, (pidx, pc) in enumerate(zip(peak_idxs, peak_colors)):
-            ax = fig.add_subplot(gs[1, panel_i])
+        fs_bars = figsize_bars if figsize_bars is not None else (4.5 * n_peaks, 4)
+        fig_bars, axes_bars = plt.subplots(
+            1, n_peaks, figsize=fs_bars,
+            gridspec_kw={"wspace": 0.4},
+        )
+        if n_peaks == 1:
+            axes_bars = [axes_bars]
 
-            # Identify high-sem heads for this layer
+        for panel_i, (pidx, pc) in enumerate(zip(peak_idxs, peak_colors)):
+            ax = axes_bars[panel_i]
+
             layer_sem  = sem_scores[pidx]
             high_heads = list(np.where(layer_sem >= sem_threshold)[0])
             if not high_heads:
                 high_heads = [int(np.argmax(layer_sem))]
 
-            data      = activations[layer_names[pidx]]
+            data         = activations[layer_names[pidx]]
             attn_maps, _ = _get_attention_maps(data, "content")
             N = min(attn_maps.shape[-1], len(res_names))
 
-            # Attention received by each category
             cat_attn: dict[str, list[float]] = {}
             for h in high_heads:
                 per_pos = attn_maps[h, :N, :N].mean(axis=0)
@@ -1681,7 +1690,6 @@ def plot_semantic_peaks(
             means = [np.mean(cat_attn.get(c, [0.0])) for c in cats]
             bars  = ax.bar(range(len(cats)), means, color=colors,
                            edgecolor="white", linewidth=0.6)
-            # Highlight the peak bar outline
             ax.spines["bottom"].set_color(pc)
             ax.spines["left"].set_color(pc)
 
@@ -1700,11 +1708,12 @@ def plot_semantic_peaks(
                             val + max(means) * 0.015,
                             f"{val:.3f}", ha="center", va="bottom", fontsize=7)
 
-        if save_path:
-            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.tight_layout()
+        if save_path_bars:
+            fig_bars.savefig(save_path_bars, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig
+    return fig_line, fig_bars
 
 
 def plot_structure_vs_top_geo_bias(
