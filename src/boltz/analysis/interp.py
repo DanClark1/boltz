@@ -954,7 +954,7 @@ def plot_full_extended_analysis(
     ax.axhline(0, color="gray", ls=":", alpha=0.5)
     ax.set_xlabel("Layer depth"); ax.set_ylabel("Score / Correlation")
     ax.set_title("Layer-wise Summary")
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=12); ax.grid(True, alpha=0.3)
 
     # Row 2 right: KL vs structure-corr scatter
     ax = axes[2, 1]
@@ -966,7 +966,7 @@ def plot_full_extended_analysis(
     ax.set_ylabel("Structure Correlation (Spearman r)")
     ax.set_title("KL Importance vs Structure Correlation\n(per head)")
     ax.axhline(0, color="gray", ls=":", alpha=0.3)
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=12); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     if save_path:
@@ -1425,14 +1425,20 @@ def run_kl_analysis(
 # ---------------------------------------------------------------------------
 
 _ACADEMIC_RC: dict = {
-    "font.family":        "sans-serif",
-    "font.size":          11,
-    "axes.labelsize":     12,
-    "axes.titlesize":     13,
-    "axes.spines.top":    False,
-    "axes.spines.right":  False,
-    "xtick.labelsize":    10,
-    "ytick.labelsize":    10,
+    "font.family":           "sans-serif",
+    "font.size":             11,
+    "axes.labelsize":        12,
+    "axes.titlesize":        13,
+    "axes.titlepad":         10,
+    "axes.labelpad":         6,
+    "axes.spines.top":       False,
+    "axes.spines.right":     False,
+    "xtick.labelsize":       10,
+    "ytick.labelsize":       10,
+    "legend.fontsize":       10,
+    "legend.framealpha":     0.8,
+    "figure.titlesize":      14,
+    "figure.titleweight":    "bold",
 }
 
 
@@ -1467,6 +1473,8 @@ def plot_kl_heatmaps_separate(
     save_geo: Optional[str] = None,
     save_sem: Optional[str] = None,
     figsize: Optional[tuple[float, float]] = None,
+    title_geo: Optional[str] = None,
+    title_sem: Optional[str] = None,
 ) -> tuple["plt.Figure", "plt.Figure"]:
     """Two separate academic heatmaps of normalised geo and sem KL scores.
 
@@ -1478,6 +1486,10 @@ def plot_kl_heatmaps_separate(
     save_geo, save_sem : str, optional
     figsize : (width, height) in inches, optional
         Override the auto-computed figure size for both panels.
+    title_geo : str, optional
+        Override the default title for the geometric heatmap.
+    title_sem : str, optional
+        Override the default title for the semantic heatmap.
 
     Returns
     -------
@@ -1489,13 +1501,11 @@ def plot_kl_heatmaps_separate(
     num_layers, num_heads = geo_scores.shape
     figs = []
 
+    _title_geo = title_geo if title_geo is not None else "Geometric attention importance\n(pairwise-bias KL score)"
+    _title_sem = title_sem if title_sem is not None else "Semantic attention importance\n(content KL score)"
     configs = [
-        (geo_scores,
-         "Geometric attention importance\n(pairwise-bias KL score)",
-         "viridis", save_geo),
-        (sem_scores,
-         "Semantic attention importance\n(content KL score)",
-         "magma",   save_sem),
+        (geo_scores, _title_geo, "viridis", save_geo),
+        (sem_scores, _title_sem, "magma",   save_sem),
     ]
 
     with plt.rc_context(_ACADEMIC_RC):
@@ -1510,7 +1520,7 @@ def plot_kl_heatmaps_separate(
             cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
             cbar.set_label("Normalised KL score", fontsize=10)
             cbar.ax.tick_params(labelsize=9)
-            plt.tight_layout()
+            plt.tight_layout(pad=1.5)
             if save_path:
                 fig.savefig(save_path, dpi=150, bbox_inches="tight")
             plt.show()
@@ -1525,6 +1535,9 @@ def plot_kl_heatmap_combined(
     layer_labels: list[int],
     save_path: Optional[str] = None,
     figsize: Optional[tuple[float, float]] = None,
+    title_geo: Optional[str] = None,
+    title_sem: Optional[str] = None,
+    suptitle: Optional[str] = None,
 ) -> plt.Figure:
     """Side-by-side geo | sem KL heatmap (academic style).
 
@@ -1535,6 +1548,12 @@ def plot_kl_heatmap_combined(
     save_path : str, optional
     figsize : (width, height) in inches, optional
         Override the auto-computed figure size.
+    title_geo : str, optional
+        Override the default title for the geometric panel.
+    title_sem : str, optional
+        Override the default title for the semantic panel.
+    suptitle : str, optional
+        If provided, add a figure-level suptitle.
 
     Returns
     -------
@@ -1544,6 +1563,9 @@ def plot_kl_heatmap_combined(
         multiple proteins).
     """
     num_layers, num_heads = geo_scores.shape
+
+    _title_geo = title_geo if title_geo is not None else "Geometric (bias KL)"
+    _title_sem = title_sem if title_sem is not None else "Semantic (content KL)"
 
     with plt.rc_context(_ACADEMIC_RC):
         if figsize is not None:
@@ -1557,14 +1579,16 @@ def plot_kl_heatmap_combined(
         for ax, scores, title, cmap in zip(
             axes,
             [geo_scores, sem_scores],
-            ["Geometric (bias KL)", "Semantic (content KL)"],
+            [_title_geo, _title_sem],
             ["viridis", "magma"],
         ):
             im = _kl_heatmap_ax(ax, scores, layer_labels, title, cmap)
             cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
             cbar.set_label("KL score (norm.)", fontsize=9)
 
-        plt.tight_layout()
+        if suptitle is not None:
+            fig.suptitle(suptitle, fontsize=14, weight="bold")
+        plt.tight_layout(pad=1.5)
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
@@ -1584,6 +1608,7 @@ def plot_semantic_peaks(
     sem_threshold: float = 0.4,
     figsize_line: Optional[tuple[float, float]] = None,
     figsize_bars: Optional[tuple[float, float]] = None,
+    title_line: Optional[str] = None,
 ) -> tuple[plt.Figure, plt.Figure]:
     """Identify semantic-attention peaks and show which residue categories they target.
 
@@ -1610,6 +1635,8 @@ def plot_semantic_peaks(
         Override the default line-plot figure size.
     figsize_bars : (width, height) in inches, optional
         Override the default bar-charts figure size.
+    title_line : str, optional
+        Override the default title for the line-plot figure.
 
     Returns
     -------
@@ -1655,13 +1682,14 @@ def plot_semantic_peaks(
         ax_top.set_ylim(bottom=0)
         ax_top.set_xlabel("Layer")
         ax_top.set_ylabel("Mean sem KL score")
-        ax_top.set_title(
+        _title = title_line if title_line is not None else (
             "Semantic attention importance across layers\n"
             "(peaks = layers with highest content-driven routing)"
         )
+        ax_top.set_title(_title)
         ax_top.legend(fontsize=9)
         ax_top.grid(True, alpha=0.2)
-        plt.tight_layout()
+        plt.tight_layout(pad=1.5)
         if save_path_line:
             fig_line.savefig(save_path_line, dpi=150, bbox_inches="tight")
         plt.show()
@@ -1705,7 +1733,7 @@ def plot_semantic_peaks(
             ax.spines["left"].set_color(pc)
 
             ax.set_xticks(range(len(cats)))
-            ax.set_xticklabels(xlabels, fontsize=8, rotation=40, ha="right")
+            ax.set_xticklabels(xlabels, fontsize=8, rotation=45, ha="right")
             ax.set_ylabel("Mean attention", fontsize=9)
             ax.set_title(
                 f"Peak {panel_i+1} — Layer {layer_labels[pidx]}\n"
@@ -1719,7 +1747,7 @@ def plot_semantic_peaks(
                             val + max(means) * 0.015,
                             f"{val:.3f}", ha="center", va="bottom", fontsize=7)
 
-        plt.tight_layout()
+        plt.tight_layout(pad=1.5)
         if save_path_bars:
             fig_bars.savefig(save_path_bars, dpi=150, bbox_inches="tight")
         plt.show()
@@ -1739,6 +1767,7 @@ def plot_geometric_peaks(
     geo_threshold: float = 0.4,
     figsize_line: Optional[tuple[float, float]] = None,
     figsize_bars: Optional[tuple[float, float]] = None,
+    title_line: Optional[str] = None,
 ) -> tuple[plt.Figure, plt.Figure]:
     """Identify geometric-attention peaks and show which residue categories they target.
 
@@ -1766,6 +1795,8 @@ def plot_geometric_peaks(
         Min normalised geo score for a head to be classified as "high-geometric".
     figsize_line : (width, height) in inches, optional
     figsize_bars : (width, height) in inches, optional
+    title_line : str, optional
+        Override the default title for the line-plot figure.
 
     Returns
     -------
@@ -1811,13 +1842,14 @@ def plot_geometric_peaks(
         ax_top.set_ylim(bottom=0)
         ax_top.set_xlabel("Layer")
         ax_top.set_ylabel("Mean geo KL score")
-        ax_top.set_title(
+        _title = title_line if title_line is not None else (
             "Geometric attention importance across layers\n"
             "(peaks = layers with highest bias-driven routing)"
         )
+        ax_top.set_title(_title)
         ax_top.legend(fontsize=9)
         ax_top.grid(True, alpha=0.2)
-        plt.tight_layout()
+        plt.tight_layout(pad=1.5)
         if save_path_line:
             fig_line.savefig(save_path_line, dpi=150, bbox_inches="tight")
         plt.show()
@@ -1861,7 +1893,7 @@ def plot_geometric_peaks(
             ax.spines["left"].set_color(pc)
 
             ax.set_xticks(range(len(cats)))
-            ax.set_xticklabels(xlabels, fontsize=8, rotation=40, ha="right")
+            ax.set_xticklabels(xlabels, fontsize=8, rotation=45, ha="right")
             ax.set_ylabel("Mean attention", fontsize=9)
             ax.set_title(
                 f"Peak {panel_i+1} — Layer {layer_labels[pidx]}\n"
@@ -1875,7 +1907,7 @@ def plot_geometric_peaks(
                             val + max(means) * 0.015,
                             f"{val:.3f}", ha="center", va="bottom", fontsize=7)
 
-        plt.tight_layout()
+        plt.tight_layout(pad=1.5)
         if save_path_bars:
             fig_bars.savefig(save_path_bars, dpi=150, bbox_inches="tight")
         plt.show()
@@ -1892,6 +1924,11 @@ def plot_structure_vs_top_geo_bias(
     save_path: Optional[str] = None,
     zoom: int = 80,
     figsize: Optional[tuple[float, float]] = None,
+    title_prox: Optional[str] = None,
+    title_bias: Optional[str] = None,
+    suptitle: Optional[str] = None,
+    save_path_prox: Optional[str] = None,
+    save_path_bias: Optional[str] = None,
 ) -> plt.Figure:
     """Predicted-structure proximity vs the top geometric head's bias matrix.
 
@@ -1910,6 +1947,16 @@ def plot_structure_vs_top_geo_bias(
         Crop matrices to first *zoom* residues for readability.
     figsize : (width, height) in inches, optional
         Override the default ``(13, 5.5)``.
+    title_prox : str, optional
+        Override the default title for the proximity panel.
+    title_bias : str, optional
+        Override the default title for the bias attention panel.
+    suptitle : str, optional
+        Override the default figure-level suptitle.
+    save_path_prox : str, optional
+        If given, also save just the proximity panel to this path.
+    save_path_bias : str, optional
+        If given, also save just the bias attention panel to this path.
 
     Returns
     -------
@@ -1934,33 +1981,50 @@ def plot_structure_vs_top_geo_bias(
     np.fill_diagonal(bias_mat, np.nan)
     np.fill_diagonal(prox_mat, np.nan)
 
+    _title_prox = title_prox if title_prox is not None else "Predicted structure\n(Cα proximity  1/(d+1))"
+    _title_bias = title_bias if title_bias is not None else f"Pairwise-bias attention\n(layer {layer_depth}, head {best_head}, geo={best_geo:.2f})"
+    _suptitle = suptitle if suptitle is not None else "Predicted 3-D structure vs geometric attention  (diagonal masked)"
+
     with plt.rc_context(_ACADEMIC_RC):
         fs = figsize if figsize is not None else (13, 5.5)
         fig, axes = plt.subplots(1, 2, figsize=fs,
                                  gridspec_kw={"wspace": 0.32})
 
         panels = [
-            (prox_mat, "Predicted structure\n(Cα proximity  1/(d+1))", "YlOrRd"),
-            (bias_mat,
-             f"Pairwise-bias attention\n(layer {layer_depth}, head {best_head}, geo={best_geo:.2f})",
-             "viridis"),
+            (prox_mat, _title_prox, "YlOrRd"),
+            (bias_mat, _title_bias, "viridis"),
         ]
-        for ax, (mat, title, cmap) in zip(axes, panels):
+        for ax, (mat, title_str, cmap) in zip(axes, panels):
             im = ax.imshow(mat, cmap=cmap, aspect="auto", interpolation="nearest")
             ax.set_xlabel("Residue index")
             ax.set_ylabel("Residue index")
-            ax.set_title(title, pad=8)
+            ax.set_title(title_str, pad=8)
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.ax.tick_params(labelsize=9)
 
-        fig.suptitle(
-            "Predicted 3-D structure vs geometric attention  (diagonal masked)",
-            fontsize=13, weight="bold", y=1.02,
-        )
-        plt.tight_layout()
+        fig.suptitle(_suptitle, fontsize=13, weight="bold", y=1.02)
+        plt.tight_layout(pad=1.5)
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
+
+        if save_path_prox or save_path_bias:
+            for panel_save, (mat, title_str, cmap) in zip(
+                [save_path_prox, save_path_bias],
+                [(prox_mat, _title_prox, "YlOrRd"), (bias_mat, _title_bias, "viridis")],
+            ):
+                if not panel_save:
+                    continue
+                fig_p, ax_p = plt.subplots(figsize=(6.5, 5.5))
+                im_p = ax_p.imshow(mat, cmap=cmap, aspect="auto", interpolation="nearest")
+                ax_p.set_xlabel("Residue index")
+                ax_p.set_ylabel("Residue index")
+                ax_p.set_title(title_str, pad=8)
+                cbar_p = fig_p.colorbar(im_p, ax=ax_p, fraction=0.046, pad=0.04)
+                cbar_p.ax.tick_params(labelsize=9)
+                plt.tight_layout(pad=1.5)
+                fig_p.savefig(panel_save, dpi=150, bbox_inches="tight")
+                plt.close(fig_p)
 
     return fig, prox_mat, bias_mat
 
@@ -1974,6 +2038,7 @@ def plot_bias_sampled_layers(
     zoom: int = 80,
     n_samples: int = 4,
     figsize: Optional[tuple[float, float]] = None,
+    suptitle: Optional[str] = None,
 ) -> plt.Figure:
     """Bias attention matrices for the top geometric head in *n_samples* evenly-spaced layers.
 
@@ -1990,6 +2055,8 @@ def plot_bias_sampled_layers(
         Number of layers to sample.  Default 4.
     figsize : (width, height) in inches, optional
         Override the default ``(4.5 * n_samples, 5)``.
+    suptitle : str, optional
+        Override the default figure-level suptitle.
 
     Returns
     -------
@@ -2037,11 +2104,9 @@ def plot_bias_sampled_layers(
             ax.set_ylabel("Residue")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=8)
 
-        fig.suptitle(
-            "Geometric attention — top geo head per sampled layer",
-            fontsize=13, weight="bold",
-        )
-        plt.tight_layout()
+        _suptitle = suptitle if suptitle is not None else "Geometric attention — top geo head per sampled layer"
+        fig.suptitle(_suptitle, fontsize=13, weight="bold")
+        plt.tight_layout(pad=1.5)
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
@@ -2062,6 +2127,7 @@ def plot_geo_head_correlation_heatmap(
     geo_threshold: float = 0.5,
     save_path: Optional[str] = None,
     figsize: Optional[tuple[float, float]] = None,
+    title: Optional[str] = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Spearman correlation between each geo head's bias attention and Cα proximity.
 
@@ -2083,6 +2149,8 @@ def plot_geo_head_correlation_heatmap(
         Heads with ``geo_scores <= geo_threshold`` are blacked out.  Default 0.5.
     save_path : str, optional
     figsize : (width, height) in inches, optional
+    title : str, optional
+        Override the default axis title.
 
     Returns
     -------
@@ -2143,16 +2211,16 @@ def plot_geo_head_correlation_heatmap(
         ax.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=8)
         ax.set_xlabel("Head")
         ax.set_ylabel("Layer")
-        ax.set_title(
+        _title = title if title is not None else (
             f"Bias–structure Spearman r  (geo heads, threshold={geo_threshold:.2f})\n"
-            "Black = below threshold",
-            pad=8,
+            "Black = below threshold"
         )
+        ax.set_title(_title, pad=8)
         cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
         cbar.set_label("Spearman r", fontsize=10)
         cbar.ax.tick_params(labelsize=9)
 
-        plt.tight_layout()
+        plt.tight_layout(pad=1.5)
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
