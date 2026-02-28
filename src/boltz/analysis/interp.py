@@ -1482,6 +1482,9 @@ def plot_kl_heatmaps_separate(
     Returns
     -------
     fig_geo, fig_sem : matplotlib.figure.Figure
+    geo_scores, sem_scores : np.ndarray
+        The arrays that were plotted (pass-through for easy collection across
+        multiple proteins).
     """
     num_layers, num_heads = geo_scores.shape
     figs = []
@@ -1513,7 +1516,7 @@ def plot_kl_heatmaps_separate(
             plt.show()
             figs.append(fig)
 
-    return tuple(figs)
+    return (*figs, geo_scores, sem_scores)
 
 
 def plot_kl_heatmap_combined(
@@ -1536,6 +1539,9 @@ def plot_kl_heatmap_combined(
     Returns
     -------
     fig : matplotlib.figure.Figure
+    geo_scores, sem_scores : np.ndarray
+        The arrays that were plotted (pass-through for easy collection across
+        multiple proteins).
     """
     num_layers, num_heads = geo_scores.shape
 
@@ -1563,7 +1569,7 @@ def plot_kl_heatmap_combined(
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig
+    return fig, geo_scores, sem_scores
 
 
 def plot_semantic_peaks(
@@ -1608,6 +1614,11 @@ def plot_semantic_peaks(
     Returns
     -------
     fig_line, fig_bars : matplotlib.figure.Figure
+    layer_mean : np.ndarray, shape ``[num_layers]``
+        Per-layer mean semantic score — the line that was plotted.
+        Collect this across proteins to overlay on a single figure.
+    peak_idxs : list[int]
+        Layer indices identified as peaks (into ``layer_names``/``layer_labels``).
     """
     num_layers = len(layer_names)
     layer_mean = sem_scores.mean(axis=1)   # [L]
@@ -1713,7 +1724,7 @@ def plot_semantic_peaks(
             fig_bars.savefig(save_path_bars, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig_line, fig_bars
+    return fig_line, fig_bars, layer_mean, peak_idxs
 
 
 def plot_geometric_peaks(
@@ -1759,6 +1770,11 @@ def plot_geometric_peaks(
     Returns
     -------
     fig_line, fig_bars : matplotlib.figure.Figure
+    layer_mean : np.ndarray, shape ``[num_layers]``
+        Per-layer mean geometric score — the line that was plotted.
+        Collect this across proteins to overlay on a single figure.
+    peak_idxs : list[int]
+        Layer indices identified as peaks (into ``layer_names``/``layer_labels``).
     """
     num_layers = len(layer_names)
     layer_mean = geo_scores.mean(axis=1)   # [L]
@@ -1864,7 +1880,7 @@ def plot_geometric_peaks(
             fig_bars.savefig(save_path_bars, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig_line, fig_bars
+    return fig_line, fig_bars, layer_mean, peak_idxs
 
 
 def plot_structure_vs_top_geo_bias(
@@ -1898,6 +1914,10 @@ def plot_structure_vs_top_geo_bias(
     Returns
     -------
     fig : matplotlib.figure.Figure
+    prox_mat : np.ndarray, shape ``[N, N]``
+        Cα proximity matrix ``1/(d+1)`` that was plotted (diagonal NaN).
+    bias_mat : np.ndarray, shape ``[N, N]``
+        Top geo-head bias attention that was plotted (diagonal NaN).
     """
     last_idx  = len(layer_names) - 1
     best_head = int(np.argmax(geo_scores[last_idx]))
@@ -1942,7 +1962,7 @@ def plot_structure_vs_top_geo_bias(
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig
+    return fig, prox_mat, bias_mat
 
 
 def plot_bias_sampled_layers(
@@ -1974,6 +1994,9 @@ def plot_bias_sampled_layers(
     Returns
     -------
     fig : matplotlib.figure.Figure
+    sampled_mats : dict[int, np.ndarray]
+        ``{layer_depth: bias_mat}`` for each sampled layer, where ``bias_mat``
+        has shape ``[N, N]``.  Collect across proteins to compare panels.
     """
     num_layers = len(layer_names)
     if n_samples == 1:
@@ -1983,6 +2006,8 @@ def plot_bias_sampled_layers(
             int(round(i * (num_layers - 1) / (n_samples - 1)))
             for i in range(n_samples)
         ]
+
+    sampled_mats: dict[int, np.ndarray] = {}
 
     with plt.rc_context(_ACADEMIC_RC):
         fs = figsize if figsize is not None else (4.5 * n_samples, 5)
@@ -2000,6 +2025,7 @@ def plot_bias_sampled_layers(
             attn_maps, _ = _get_attention_maps(activations[layer_names[lidx]], "bias")
             N   = min(attn_maps.shape[-1], len(res_names), zoom)
             mat = attn_maps[best_head, :N, :N]
+            sampled_mats[layer_depth] = mat
 
             im = ax.imshow(mat, cmap="viridis", aspect="auto",
                            interpolation="nearest", vmin=0)
@@ -2020,4 +2046,115 @@ def plot_bias_sampled_layers(
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig
+    return fig, sampled_mats
+
+
+# ---------------------------------------------------------------------------
+# 13. Geo-head bias–structure correlation heatmap
+# ---------------------------------------------------------------------------
+
+def plot_geo_head_correlation_heatmap(
+    activations: dict,
+    layer_names: list[str],
+    ca_dist: np.ndarray,
+    res_names: list[str],
+    geo_scores: np.ndarray,
+    geo_threshold: float = 0.5,
+    save_path: Optional[str] = None,
+    figsize: Optional[tuple[float, float]] = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """Spearman correlation between each geo head's bias attention and Cα proximity.
+
+    Only heads whose ``geo_scores`` exceeds ``geo_threshold`` are evaluated;
+    the rest are blacked out on the heatmap.
+
+    Parameters
+    ----------
+    activations : dict
+        Single-step activations (output of :func:`get_recycling_step`).
+    layer_names : list[str]
+        Ordered main-pairformer layer names.
+    ca_dist : np.ndarray, shape ``[N, N]``
+        Pairwise Cα distances in Å.
+    res_names : list[str]
+    geo_scores : np.ndarray, shape ``[num_layers, num_heads]``
+        Geometric scores (ratio or raw-normalised) for thresholding.
+    geo_threshold : float
+        Heads with ``geo_scores <= geo_threshold`` are blacked out.  Default 0.5.
+    save_path : str, optional
+    figsize : (width, height) in inches, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
+        Spearman r values; NaN for heads below threshold.
+    """
+    from scipy.stats import spearmanr
+
+    num_layers = len(layer_names)
+    num_heads  = geo_scores.shape[1]
+    corr_mat   = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+
+    N_dist = ca_dist.shape[0]
+    prox   = 1.0 / (ca_dist + 1.0)
+
+    for i, name in enumerate(layer_names):
+        data         = activations[name]
+        attn_maps, _ = _get_attention_maps(data, "bias")
+        N = min(attn_maps.shape[-1], len(res_names), N_dist)
+
+        prox_flat = prox[:N, :N].copy()
+        np.fill_diagonal(prox_flat, np.nan)
+        mask     = ~np.isnan(prox_flat)
+        prox_vec = prox_flat[mask]
+
+        for h in range(num_heads):
+            if geo_scores[i, h] <= geo_threshold:
+                continue  # leave NaN → blacked out
+
+            bias_mat = attn_maps[h, :N, :N].copy().astype(float)
+            np.fill_diagonal(bias_mat, np.nan)
+            bias_vec = bias_mat[mask]
+
+            r, _ = spearmanr(prox_vec, bias_vec)
+            corr_mat[i, h] = float(r)
+
+    layer_labels = [_layer_idx_from_name(n) for n in layer_names]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fs = figsize if figsize is not None else (
+            max(7, num_heads * 0.5 + 2),
+            max(5, num_layers * 0.18 + 2),
+        )
+        fig, ax = plt.subplots(figsize=fs)
+
+        cmap = plt.cm.RdBu_r.copy()
+        cmap.set_bad("black")
+
+        masked = np.ma.masked_invalid(corr_mat)
+        im = ax.imshow(masked, cmap=cmap, vmin=-1, vmax=1, aspect="auto",
+                       interpolation="nearest")
+
+        step = max(1, num_layers // 10)
+        ax.set_yticks(range(0, num_layers, step))
+        ax.set_yticklabels([str(layer_labels[p]) for p in range(0, num_layers, step)])
+        ax.set_xticks(range(num_heads))
+        ax.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=8)
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer")
+        ax.set_title(
+            f"Bias–structure Spearman r  (geo heads, threshold={geo_threshold:.2f})\n"
+            "Black = below threshold",
+            pad=8,
+        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+        cbar.set_label("Spearman r", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+        plt.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig, corr_mat

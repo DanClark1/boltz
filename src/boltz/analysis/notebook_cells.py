@@ -356,11 +356,12 @@ print("\nInference complete.")
 
 ──────────────────────────────────────────────────────────────────────────────
 CELL 11 – Analysis & figure pipeline
-          Loads saved activations for each example and generates all plots
-          into /content/drive/MyDrive/final_experiments/<example>/.
+          Loads saved activations for each example and generates all plots.
+          Per-example figures → final_experiments/<example>/
+          Multi-protein overlays → final_experiments/combined/
 ──────────────────────────────────────────────────────────────────────────────
 
-import os, re, numpy as np, torch
+import os, re, numpy as np, torch, matplotlib.pyplot as plt
 from boltz.analysis.interp import (
     get_recycling_step,
     compute_ca_coords,
@@ -370,18 +371,58 @@ from boltz.analysis.interp import (
     plot_kl_heatmap_combined,
     plot_semantic_peaks,
     plot_geometric_peaks,
+    plot_geo_head_correlation_heatmap,
     plot_structure_vs_top_geo_bias,
     plot_bias_sampled_layers,
 )
 
-DRIVE    = "/content/drive/MyDrive"
-OUT_ROOT = f"{DRIVE}/final_experiments"
-EXAMPLES = ["prot_no_msa", "prot", "multimer", "cyclic_prot"]
+DRIVE      = "/content/drive/MyDrive"
+OUT_ROOT   = f"{DRIVE}/final_experiments"
+GLOBAL_DIR = f"{OUT_ROOT}/combined"          # multi-protein overlays
+EXAMPLES   = ["prot_no_msa", "prot", "multimer", "cyclic_prot"]
+os.makedirs(GLOBAL_DIR, exist_ok=True)
+
+# One colour per protein for overlay plots
+EXAMPLE_COLORS = {
+    "prot_no_msa": "#5B8DB8",
+    "prot":        "#E07B7B",
+    "multimer":    "#5BA85B",
+    "cyclic_prot": "#C05A2A",
+}
+
+# ------------------------------------------------------------------
+# Figure sizes — tweak (width, height) in inches per figure.
+# Set any entry to None to use automatic sizing.
+# ------------------------------------------------------------------
+FIG_SIZES = {
+    "rq1_heatmap":        None,        # e.g. (8, 10)  — both geo and sem panels
+    "rq1_combined":       None,
+    "rq1_sem_peaks_line": None,        # e.g. (10, 4)
+    "rq1_sem_peaks_bars": None,        # e.g. (14, 4)
+    "rq1_geo_peaks_line": None,
+    "rq1_geo_peaks_bars": None,
+    "rq1_corr":           None,        # e.g. (10, 8)
+    "rq2_struct":         None,        # e.g. (14, 6)
+    "rq2_sampled":        None,        # e.g. (20, 5)
+    "overlay":            (14, 8),     # multi-protein overlay figure
+}
+
+# Geo threshold for the correlation experiment
+GEO_THRESHOLD = 0.5
 
 def _layer_idx(name):
     m = re.search(r"layers\.(\d+)", name)
     return int(m.group(1)) if m else -1
 
+# Dicts to collect layer-mean lines across proteins for the overlay
+sem_lines_ratio = {}
+geo_lines_ratio = {}
+sem_lines_raw   = {}
+geo_lines_raw   = {}
+
+# ======================================================================
+# Per-example loop
+# ======================================================================
 for example in EXAMPLES:
     raw_dir = f"{OUT_ROOT}/{example}/raw"
     out_dir = f"{OUT_ROOT}/{example}"
@@ -393,12 +434,11 @@ for example in EXAMPLES:
         continue
 
     print(f"\n{'='*60}\n[{example}] Loading data …")
-    all_acts  = torch.load(acts_path,            map_location="cpu")
+    all_acts  = torch.load(acts_path,               map_location="cpu")
     coords    = torch.load(f"{raw_dir}/coords.pt",  map_location="cpu")
     meta      = torch.load(f"{raw_dir}/meta.pt",    map_location="cpu")
     res_names = meta["res_names"]
 
-    # Main pairformer layers only (startswith filter avoids confidence module)
     layer_names  = sorted(
         [k for k in all_acts if k.startswith("pairformer_module.")],
         key=_layer_idx,
@@ -406,98 +446,98 @@ for example in EXAMPLES:
     layer_labels = [_layer_idx(n) for n in layer_names]
     print(f"  Layers: {len(layer_names)}   Residues: {len(res_names)}")
 
-    # Final recycling step activations
-    acts = get_recycling_step(all_acts, step=-1)
-
-    # Cα distance matrix
+    acts      = get_recycling_step(all_acts, step=-1)
     ca_coords = compute_ca_coords(coords, res_names, sample_idx=0)
     ca_dist   = compute_distance_matrix(ca_coords)
 
-    # KL analysis (may take ~1–2 min for large structures)
+    # ── KL analysis ───────────────────────────────────────────────────
     print("  Running KL analysis …", flush=True)
     geo_raw, sem_raw = run_kl_analysis(acts, layer_names, num_trials=5)
 
-    # Normalise each axis against its own 95th percentile so both heatmaps
-    # span [0, 1] — matching the original analysis.
-    geo_p95    = np.percentile(geo_raw, 95)
-    sem_p95    = np.percentile(sem_raw, 95)
-    geo_scores = np.clip(geo_raw / (geo_p95 + 1e-10), 0, 1)
-    sem_scores = np.clip(sem_raw / (sem_p95 + 1e-10), 0, 1)
-    print(f"  geo mean={geo_scores.mean():.3f}  sem mean={sem_scores.mean():.3f}")
+    # Metric A — ratio: geo / (geo + sem), values in [0, 1], sum to 1 per head
+    total     = geo_raw + sem_raw + 1e-10
+    geo_ratio = geo_raw / total
+    sem_ratio = sem_raw / total
 
-    # ------------------------------------------------------------------
-    # Figure sizes — tweak (width, height) in inches per figure.
-    # Set any entry to None to use automatic sizing.
-    # ------------------------------------------------------------------
-    FIG_SIZES = {
-        "rq1_geo":        None,        # e.g. (8, 10)
-        "rq1_sem":        None,
-        "rq1_combined":   None,
-        "rq1_sem_peaks_line": None,    # e.g. (10, 4)
-        "rq1_sem_peaks_bars": None,    # e.g. (14, 4)
-        "rq1_geo_peaks_line": None,    # e.g. (10, 4)
-        "rq1_geo_peaks_bars": None,    # e.g. (14, 4)
-        "rq2_struct":     None,        # e.g. (14, 6)
-        "rq2_sampled":    None,        # e.g. (20, 5)
-    }
+    # Metric B — raw KL normalised by 95th percentile (independent axes)
+    geo_p95  = np.percentile(geo_raw, 95)
+    sem_p95  = np.percentile(sem_raw, 95)
+    geo_norm = np.clip(geo_raw / (geo_p95 + 1e-10), 0, 1)
+    sem_norm = np.clip(sem_raw / (sem_p95 + 1e-10), 0, 1)
 
-    # ------------------------------------------------------------------
-    # RQ1-1  Separate academic heatmaps (geo / sem)
-    # ------------------------------------------------------------------
-    plot_kl_heatmaps_separate(
-        geo_scores, sem_scores, layer_labels,
-        save_geo=f"{out_dir}/rq1_geo_heatmap.png",
-        save_sem=f"{out_dir}/rq1_sem_heatmap.png",
-        figsize=FIG_SIZES["rq1_geo"],   # applies to both panels
+    print(f"  ratio  geo={geo_ratio.mean():.3f}  sem={sem_ratio.mean():.3f}")
+    print(f"  raw    geo={geo_norm.mean():.3f}  sem={sem_norm.mean():.3f}")
+
+    # ── RQ1-1  Heatmaps – both metrics ────────────────────────────────
+    for tag, geo_s, sem_s in [("ratio", geo_ratio, sem_ratio),
+                               ("raw",   geo_norm,  sem_norm)]:
+        plot_kl_heatmaps_separate(
+            geo_s, sem_s, layer_labels,
+            save_geo=f"{out_dir}/rq1_{tag}_geo_heatmap.png",
+            save_sem=f"{out_dir}/rq1_{tag}_sem_heatmap.png",
+            figsize=FIG_SIZES["rq1_heatmap"],
+        )
+        plot_kl_heatmap_combined(
+            geo_s, sem_s, layer_labels,
+            save_path=f"{out_dir}/rq1_{tag}_combined_heatmap.png",
+            figsize=FIG_SIZES["rq1_combined"],
+        )
+
+    # ── RQ1-3  Semantic peaks – both metrics ──────────────────────────
+    _, _, sem_lines_ratio[example], _ = plot_semantic_peaks(
+        acts, layer_names, res_names, sem_ratio, layer_labels,
+        n_peaks=3, sem_threshold=0.4,
+        save_path_line=f"{out_dir}/rq1_ratio_sem_peaks_line.png",
+        save_path_bars=f"{out_dir}/rq1_ratio_sem_peaks_bars.png",
+        figsize_line=FIG_SIZES["rq1_sem_peaks_line"],
+        figsize_bars=FIG_SIZES["rq1_sem_peaks_bars"],
     )
-
-    # ------------------------------------------------------------------
-    # RQ1-2  Combined geo|sem heatmap
-    # ------------------------------------------------------------------
-    plot_kl_heatmap_combined(
-        geo_scores, sem_scores, layer_labels,
-        save_path=f"{out_dir}/rq1_combined_heatmap.png",
-        figsize=FIG_SIZES["rq1_combined"],
-    )
-
-    # ------------------------------------------------------------------
-    # RQ1-3  Semantic peaks & residue-category analysis
-    # ------------------------------------------------------------------
-    plot_semantic_peaks(
-        acts, layer_names, res_names, sem_scores, layer_labels,
-        n_peaks=3,
-        sem_threshold=0.4,
-        save_path_line=f"{out_dir}/rq1_semantic_peaks_line.png",
-        save_path_bars=f"{out_dir}/rq1_semantic_peaks_bars.png",
+    _, _, sem_lines_raw[example], _ = plot_semantic_peaks(
+        acts, layer_names, res_names, sem_norm, layer_labels,
+        n_peaks=3, sem_threshold=0.4,
+        save_path_line=f"{out_dir}/rq1_raw_sem_peaks_line.png",
+        save_path_bars=f"{out_dir}/rq1_raw_sem_peaks_bars.png",
         figsize_line=FIG_SIZES["rq1_sem_peaks_line"],
         figsize_bars=FIG_SIZES["rq1_sem_peaks_bars"],
     )
 
-    plot_geometric_peaks(
-        acts, layer_names, res_names, geo_scores, layer_labels,
-        n_peaks=3,
-        geo_threshold=0.4,
-        save_path_line=f"{out_dir}/rq1_geometric_peaks_line.png",
-        save_path_bars=f"{out_dir}/rq1_geometric_peaks_bars.png",
+    # ── RQ1-4  Geometric peaks – both metrics ─────────────────────────
+    _, _, geo_lines_ratio[example], _ = plot_geometric_peaks(
+        acts, layer_names, res_names, geo_ratio, layer_labels,
+        n_peaks=3, geo_threshold=0.4,
+        save_path_line=f"{out_dir}/rq1_ratio_geo_peaks_line.png",
+        save_path_bars=f"{out_dir}/rq1_ratio_geo_peaks_bars.png",
+        figsize_line=FIG_SIZES["rq1_geo_peaks_line"],
+        figsize_bars=FIG_SIZES["rq1_geo_peaks_bars"],
+    )
+    _, _, geo_lines_raw[example], _ = plot_geometric_peaks(
+        acts, layer_names, res_names, geo_norm, layer_labels,
+        n_peaks=3, geo_threshold=0.4,
+        save_path_line=f"{out_dir}/rq1_raw_geo_peaks_line.png",
+        save_path_bars=f"{out_dir}/rq1_raw_geo_peaks_bars.png",
         figsize_line=FIG_SIZES["rq1_geo_peaks_line"],
         figsize_bars=FIG_SIZES["rq1_geo_peaks_bars"],
     )
 
-    # ------------------------------------------------------------------
-    # RQ2-1  Predicted structure vs top geo-head bias (last layer)
-    # ------------------------------------------------------------------
+    # ── RQ1-5  Geo-head bias–structure correlation (ratio metric) ─────
+    plot_geo_head_correlation_heatmap(
+        acts, layer_names, ca_dist, res_names, geo_ratio,
+        geo_threshold=GEO_THRESHOLD,
+        save_path=f"{out_dir}/rq1_geo_corr_heatmap.png",
+        figsize=FIG_SIZES["rq1_corr"],
+    )
+
+    # ── RQ2-1  Predicted structure vs top geo-head bias ───────────────
     plot_structure_vs_top_geo_bias(
-        acts, layer_names, ca_dist, res_names, geo_scores,
+        acts, layer_names, ca_dist, res_names, geo_ratio,
         zoom=min(80, len(res_names)),
         save_path=f"{out_dir}/rq2_structure_vs_bias.png",
         figsize=FIG_SIZES["rq2_struct"],
     )
 
-    # ------------------------------------------------------------------
-    # RQ2-2  Four bias matrices equally spaced through model depth
-    # ------------------------------------------------------------------
+    # ── RQ2-2  Four bias matrices equally spaced through model depth ──
     plot_bias_sampled_layers(
-        acts, layer_names, geo_scores, res_names,
+        acts, layer_names, geo_ratio, res_names,
         zoom=min(80, len(res_names)),
         n_samples=4,
         save_path=f"{out_dir}/rq2_bias_sampled.png",
@@ -505,6 +545,38 @@ for example in EXAMPLES:
     )
 
     print(f"  All figures saved to {out_dir}")
+
+# ======================================================================
+# Multi-protein overlay — sem & geo lines for both metrics on one figure
+# ======================================================================
+print(f"\nGenerating multi-protein overlay …")
+
+fs = FIG_SIZES["overlay"]
+fig, axes = plt.subplots(2, 2, figsize=fs,
+                         gridspec_kw={"hspace": 0.45, "wspace": 0.35})
+
+overlay_configs = [
+    (axes[0, 0], sem_lines_ratio, "Semantic score (ratio)"),
+    (axes[0, 1], geo_lines_ratio, "Geometric score (ratio)"),
+    (axes[1, 0], sem_lines_raw,   "Semantic score (raw norm.)"),
+    (axes[1, 1], geo_lines_raw,   "Geometric score (raw norm.)"),
+]
+
+for ax, lines, title in overlay_configs:
+    for name, line in lines.items():
+        ax.plot(line, color=EXAMPLE_COLORS.get(name, "gray"), lw=1.8, label=name)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Mean score")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.2)
+    ax.set_ylim(bottom=0)
+
+fig.suptitle("Geo / Sem routing across proteins", fontsize=13, weight="bold")
+plt.tight_layout()
+fig.savefig(f"{GLOBAL_DIR}/multi_protein_overlay.png", dpi=150, bbox_inches="tight")
+plt.show()
+print(f"  Overlay saved to {GLOBAL_DIR}/multi_protein_overlay.png")
 
 print("\nPipeline complete.")
 """
