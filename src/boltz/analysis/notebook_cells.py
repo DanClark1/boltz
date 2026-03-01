@@ -588,11 +588,12 @@ def process_example(example):
         best_flat   = int(np.nanargmax(corr_mat))
         best_layer  = layer_labels[best_flat // num_heads]
         best_head   = best_flat % num_heads
-        best_r      = float(np.nanmax(corr_mat))
-        corr_mean   = float(valid_corrs.mean())
-        corr_std    = float(valid_corrs.std())
+        best_r        = float(np.nanmax(corr_mat))
+        corr_mean     = float(valid_corrs.mean())
+        corr_std      = float(valid_corrs.std())
+        corr_mean_abs = float(np.abs(valid_corrs).mean())
     else:
-        best_layer = best_head = best_r = corr_mean = corr_std = float("nan")
+        best_layer = best_head = best_r = corr_mean = corr_std = corr_mean_abs = float("nan")
 
     summary_lines = [
         f"Structure summary: {label} ({example})",
@@ -614,6 +615,7 @@ def process_example(example):
         f"── Bias–structure Spearman r (geo threshold {GEO_THRESHOLD:.0%}) ──",
         f"  Geo heads above threshold : {n_geo_heads} / {len(layer_names) * num_heads}",
         f"  Mean Spearman r    : {corr_mean:.4f}",
+        f"  Mean |Spearman r|  : {corr_mean_abs:.4f}",
         f"  Std  Spearman r    : {corr_std:.4f}",
         f"  Best head          : layer {best_layer}, head {best_head}  (r = {best_r:.4f})",
     ]

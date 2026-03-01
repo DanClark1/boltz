@@ -2339,8 +2339,8 @@ def plot_bias_correlation_gallery(
             left=0.07, right=0.96, top=0.90, bottom=0.06,
         )
 
-        # ── Top row: ground-truth contact/proximity map (cols 1-2) ────
-        ax_cont = fig.add_subplot(gs[0, 1:3])
+        # ── Top row: ground-truth contact/proximity map (cols 0-1, top-left) ─
+        ax_cont = fig.add_subplot(gs[0, 0:2])
         if prox_mat is not None:
             N_p  = min(prox_mat.shape[0], len(res_names), zoom)
             pm   = prox_mat[:N_p, :N_p]
