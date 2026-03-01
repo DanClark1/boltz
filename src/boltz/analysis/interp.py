@@ -2300,7 +2300,7 @@ def plot_bias_correlation_gallery(
         li, hi = sorted_idxs[rank]
         selected[tag] = (int(li), int(hi), float(sorted_vals[rank]))
 
-    sel_labels = ["High correlation", "Mid correlation", "Low correlation"]
+    sel_labels = ["Close Contacts", "Sequential Encoding", "Long-Range Contacts"]
     sel_colors = ["#2E7D32", "#E65100", "#C62828"]   # green / orange / red
 
     num_layers, num_heads = corr_mat.shape
