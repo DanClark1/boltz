@@ -2237,13 +2237,16 @@ def plot_bias_correlation_gallery(
     layer_names: list[str],
     res_names: list[str],
     corr_mat: np.ndarray,
+    prox_mat: Optional[np.ndarray] = None,
     geo_threshold: float = 0.5,
     zoom: int = 80,
     save_path: Optional[str] = None,
     figsize: Optional[tuple[float, float]] = None,
     title: Optional[str] = None,
+    contact_title: Optional[str] = None,
 ) -> tuple[plt.Figure, dict]:
-    """Correlation heatmap (top) with three representative bias matrices (bottom).
+    """Correlation heatmap + ground-truth contact map (top row) with three
+    representative bias matrices (bottom row).
 
     The three heads are selected from among geo heads above *geo_threshold*:
 
@@ -2254,6 +2257,11 @@ def plot_bias_correlation_gallery(
     Dashed connector lines link each selected cell in the heatmap to its
     bias-attention matrix below.
 
+    Layout (6-column grid, each matrix spans 2 cols):
+
+    ``[  ] [contact_map] [corr_heatmap] [  ]``
+    ``[matrix high  ] [matrix mid  ] [matrix low  ]``
+
     Parameters
     ----------
     activations : dict
@@ -2262,14 +2270,20 @@ def plot_bias_correlation_gallery(
     res_names : list[str]
     corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
         Output of :func:`plot_geo_head_correlation_heatmap`; NaN = below threshold.
+    prox_mat : np.ndarray, shape ``[N, N]``, optional
+        Ground-truth proximity matrix (e.g. ``1 / (ca_dist + 1)``).  When
+        provided a contact-map panel is shown in the top-left position.
     geo_threshold : float
         Only used for the figure title annotation.
     zoom : int
         Crop bias matrices to first *zoom* residues.
     save_path : str, optional
     figsize : (width, height) in inches, optional
-        Default ``(15, 11)``.
+        Default ``(16, 11)``.
     title : str, optional
+        Title for the correlation heatmap panel.
+    contact_title : str, optional
+        Title for the ground-truth contact map panel.
 
     Returns
     -------
@@ -2307,21 +2321,44 @@ def plot_bias_correlation_gallery(
     layer_labels = [_layer_idx_from_name(n) for n in layer_names]
 
     with plt.rc_context(_ACADEMIC_RC):
-        fs  = figsize if figsize is not None else (12, 11)
+        fs  = figsize if figsize is not None else (16, 11)
         fig = plt.figure(figsize=fs)
 
-        # Two rows: heatmap (same width as one matrix, centred) + 3 matrices.
-        # Row 0 col 1 only is used; cols 0 and 2 are empty to leave space for
-        # the dashed connector lines to the outer matrices.
+        # 6-column grid so every panel (contact map, heatmap, 3 bias matrices)
+        # spans exactly 2 sub-columns, giving equal widths throughout.
+        #
+        # Row 0:  [empty] [contact_map cols 1-2] [heatmap cols 3-4] [empty]
+        # Row 1:  [mat_high cols 0-1] [mat_mid cols 2-3] [mat_low cols 4-5]
+        #
+        # The top-row panels sit "between" the bottom-row panels, centred above
+        # the seams.  Connector lines (clip_on=False) bridge the gap.
         gs = fig.add_gridspec(
-            2, 3,
+            2, 6,
             height_ratios=[1.0, 1.0],
-            hspace=0.60, wspace=0.38,
+            hspace=0.65, wspace=0.45,
             left=0.07, right=0.96, top=0.90, bottom=0.06,
         )
 
-        # ── Top row: correlation heatmap (centre column only) ─────────
-        ax_heat = fig.add_subplot(gs[0, 1])
+        # ── Top row: ground-truth contact/proximity map (cols 1-2) ────
+        ax_cont = fig.add_subplot(gs[0, 1:3])
+        if prox_mat is not None:
+            N_p  = min(prox_mat.shape[0], len(res_names), zoom)
+            pm   = prox_mat[:N_p, :N_p]
+            im_c = ax_cont.imshow(pm, cmap="Greens", aspect="auto",
+                                  interpolation="nearest", vmin=0, vmax=pm.max())
+            cb_c = fig.colorbar(im_c, ax=ax_cont, fraction=0.046, pad=0.04)
+            cb_c.set_label("Proximity", fontsize=9)
+            cb_c.ax.tick_params(labelsize=8)
+            ax_cont.set_xlabel("Residue", fontsize=9)
+            ax_cont.set_ylabel("Residue", fontsize=9)
+        else:
+            ax_cont.set_visible(False)
+
+        _ctitle = contact_title if contact_title is not None else "Ground-truth Cα proximity"
+        ax_cont.set_title(_ctitle, pad=10)
+
+        # ── Top row: bias–structure correlation heatmap (cols 3-4) ────
+        ax_heat = fig.add_subplot(gs[0, 3:5])
 
         cmap_heat = plt.cm.RdBu_r.copy()
         cmap_heat.set_bad("black")
@@ -2345,7 +2382,7 @@ def plot_bias_correlation_gallery(
         )
         ax_heat.set_title(_title, pad=10)
 
-        cbar = fig.colorbar(im, ax=ax_heat, fraction=0.015, pad=0.01)
+        cbar = fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
         cbar.set_label("Spearman r", fontsize=10)
         cbar.ax.tick_params(labelsize=9)
 
@@ -2358,7 +2395,8 @@ def plot_bias_correlation_gallery(
             ax_heat.add_patch(rect)
 
         # ── Bottom row: one bias matrix per selected head ─────────────
-        bias_axes = [fig.add_subplot(gs[1, col]) for col in range(3)]
+        # cols 0-1, 2-3, 4-5 (each spans 2 sub-columns)
+        bias_axes = [fig.add_subplot(gs[1, c*2 : c*2+2]) for c in range(3)]
 
         for ax_b, (tag, (li, hi, r_val)), lbl, color in zip(
             bias_axes, selected.items(), sel_labels, sel_colors
@@ -2384,8 +2422,7 @@ def plot_bias_correlation_gallery(
             cb = fig.colorbar(im_b, ax=ax_b, fraction=0.046, pad=0.04)
             cb.ax.tick_params(labelsize=8)
 
-            # ── Dashed connector line: heatmap cell → top-centre of matrix
-            # coordsA="data": x = head col, y = layer row in the heatmap image
+            # ── Dashed connector: heatmap cell → top-centre of bias matrix
             con = mpatches.ConnectionPatch(
                 xyA=(hi, li),
                 xyB=(0.5, 1.0),
@@ -2395,11 +2432,11 @@ def plot_bias_correlation_gallery(
                 axesB=ax_b,
                 color=color,
                 lw=1.5,
-                ls=(0, (5, 4)),      # dashed
+                ls=(0, (5, 4)),
                 alpha=0.80,
                 zorder=10,
                 clip_on=False,
-                shrinkB=52,          # stop before the title text
+                shrinkB=42,          # stop before the title text
             )
             fig.add_artist(con)
 

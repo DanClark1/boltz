@@ -545,13 +545,16 @@ def process_example(example):
 
     # ── RQ1-6  Bias correlation gallery ───────────────────────────────
     if corr_mat is not None and (~np.isnan(corr_mat)).sum() >= 3:
+        prox_mat = 1.0 / (ca_dist + 1.0)
         plot_bias_correlation_gallery(
             acts, layer_names, res_names, corr_mat,
+            prox_mat=prox_mat,
             geo_threshold=GEO_THRESHOLD,
             zoom=min(80, len(res_names)),
             save_path=sp("rq1_corr_gallery"),
             figsize=FIG_SIZES["rq1_corr_gallery"],
-            title=f"Bias–structure correlation gallery  —  {label}",
+            title=f"Bias–structure Spearman r  —  {label}",
+            contact_title=f"Ground-truth Cα proximity  —  {label}",
         )
 
     # ── RQ2-1  Structure proximity vs bias attention ───────────────────
