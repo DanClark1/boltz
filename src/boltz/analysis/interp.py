@@ -2226,3 +2226,183 @@ def plot_geo_head_correlation_heatmap(
         plt.show()
 
     return fig, corr_mat
+
+
+# ---------------------------------------------------------------------------
+# 14. Bias-correlation gallery
+# ---------------------------------------------------------------------------
+
+def plot_bias_correlation_gallery(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    corr_mat: np.ndarray,
+    geo_threshold: float = 0.5,
+    zoom: int = 80,
+    save_path: Optional[str] = None,
+    figsize: Optional[tuple[float, float]] = None,
+    title: Optional[str] = None,
+) -> tuple[plt.Figure, dict]:
+    """Correlation heatmap (top) with three representative bias matrices (bottom).
+
+    The three heads are selected from among geo heads above *geo_threshold*:
+
+    - **High**: head with the highest Spearman r
+    - **Mid**: head closest to the median r value
+    - **Low**: head with the lowest Spearman r
+
+    Dashed connector lines link each selected cell in the heatmap to its
+    bias-attention matrix below.
+
+    Parameters
+    ----------
+    activations : dict
+        Single-step activations from :func:`get_recycling_step`.
+    layer_names : list[str]
+    res_names : list[str]
+    corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
+        Output of :func:`plot_geo_head_correlation_heatmap`; NaN = below threshold.
+    geo_threshold : float
+        Only used for the figure title annotation.
+    zoom : int
+        Crop bias matrices to first *zoom* residues.
+    save_path : str, optional
+    figsize : (width, height) in inches, optional
+        Default ``(15, 11)``.
+    title : str, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    selected : dict
+        ``{'high': (layer_i, head_i, r), 'mid': ..., 'low': ...}``
+    """
+    # ── Select three representative heads ─────────────────────────────
+    valid_mask = ~np.isnan(corr_mat)
+    if valid_mask.sum() < 3:
+        raise ValueError(
+            f"Fewer than 3 geo heads above threshold ({valid_mask.sum()} found); "
+            "cannot build gallery."
+        )
+
+    valid_idxs  = np.argwhere(valid_mask)           # [K, 2] — (layer_i, head_i)
+    valid_vals  = corr_mat[valid_mask]              # [K]
+    sorted_ord  = np.argsort(valid_vals)[::-1]     # descending by r
+    sorted_idxs = valid_idxs[sorted_ord]
+    sorted_vals = valid_vals[sorted_ord]
+
+    n_valid   = len(sorted_vals)
+    mid_rank  = int(np.argmin(np.abs(sorted_vals - np.median(sorted_vals))))
+    sel_ranks  = [0, mid_rank, n_valid - 1]
+
+    selected: dict = {}
+    for rank, tag in zip(sel_ranks, ["high", "mid", "low"]):
+        li, hi = sorted_idxs[rank]
+        selected[tag] = (int(li), int(hi), float(sorted_vals[rank]))
+
+    sel_labels = ["High correlation", "Mid correlation", "Low correlation"]
+    sel_colors = ["#2E7D32", "#E65100", "#C62828"]   # green / orange / red
+
+    num_layers, num_heads = corr_mat.shape
+    layer_labels = [_layer_idx_from_name(n) for n in layer_names]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fs  = figsize if figsize is not None else (15, 11)
+        fig = plt.figure(figsize=fs)
+
+        # Two rows: heatmap (taller) + 3 matrices; explicit margins to give
+        # space for the connector lines between the rows.
+        gs = fig.add_gridspec(
+            2, 3,
+            height_ratios=[1.8, 1.0],
+            hspace=0.60, wspace=0.38,
+            left=0.07, right=0.96, top=0.90, bottom=0.06,
+        )
+
+        # ── Top row: correlation heatmap ──────────────────────────────
+        ax_heat = fig.add_subplot(gs[0, :])
+
+        cmap_heat = plt.cm.RdBu_r.copy()
+        cmap_heat.set_bad("black")
+        masked = np.ma.masked_invalid(corr_mat)
+        im = ax_heat.imshow(masked, cmap=cmap_heat, vmin=-1, vmax=1,
+                            aspect="auto", interpolation="nearest")
+
+        step = max(1, num_layers // 10)
+        ax_heat.set_yticks(range(0, num_layers, step))
+        ax_heat.set_yticklabels(
+            [str(layer_labels[p]) for p in range(0, num_layers, step)]
+        )
+        ax_heat.set_xticks(range(num_heads))
+        ax_heat.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=9)
+        ax_heat.set_xlabel("Attention head", labelpad=6)
+        ax_heat.set_ylabel("Layer", labelpad=6)
+
+        _title = title if title is not None else (
+            f"Bias–structure Spearman r  (geo threshold={geo_threshold:.0%};  "
+            "black = below threshold)"
+        )
+        ax_heat.set_title(_title, pad=10)
+
+        cbar = fig.colorbar(im, ax=ax_heat, fraction=0.015, pad=0.01)
+        cbar.set_label("Spearman r", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+        # Highlight selected cells with coloured rectangles
+        for (li, hi, _), color in zip(selected.values(), sel_colors):
+            rect = plt.Rectangle(
+                (hi - 0.5, li - 0.5), 1, 1,
+                linewidth=2.5, edgecolor=color, facecolor="none", zorder=5,
+            )
+            ax_heat.add_patch(rect)
+
+        # ── Bottom row: one bias matrix per selected head ─────────────
+        bias_axes = [fig.add_subplot(gs[1, col]) for col in range(3)]
+
+        for ax_b, (tag, (li, hi, r_val)), lbl, color in zip(
+            bias_axes, selected.items(), sel_labels, sel_colors
+        ):
+            data         = activations[layer_names[li]]
+            attn_maps, _ = _get_attention_maps(data, "bias")
+            N   = min(attn_maps.shape[-1], len(res_names), zoom)
+            mat = attn_maps[hi, :N, :N]
+
+            im_b = ax_b.imshow(mat, cmap="viridis", aspect="auto",
+                               interpolation="nearest", vmin=0)
+            ax_b.set_title(
+                f"{lbl}\nLayer {layer_labels[li]}, Head {hi}   r = {r_val:.3f}",
+                fontsize=10, color=color, pad=8,
+            )
+            ax_b.set_xlabel("Residue", fontsize=9)
+            ax_b.set_ylabel("Residue", fontsize=9)
+
+            for spine in ax_b.spines.values():
+                spine.set_edgecolor(color)
+                spine.set_linewidth(2.0)
+
+            cb = fig.colorbar(im_b, ax=ax_b, fraction=0.046, pad=0.04)
+            cb.ax.tick_params(labelsize=8)
+
+            # ── Dashed connector line: heatmap cell → top-centre of matrix
+            # coordsA="data": x = head col, y = layer row in the heatmap image
+            con = mpatches.ConnectionPatch(
+                xyA=(hi, li),
+                xyB=(0.5, 1.0),
+                coordsA="data",
+                coordsB="axes fraction",
+                axesA=ax_heat,
+                axesB=ax_b,
+                color=color,
+                lw=1.5,
+                ls=(0, (5, 4)),      # dashed
+                alpha=0.80,
+                zorder=10,
+                clip_on=False,
+            )
+            fig.add_artist(con)
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig, selected

@@ -373,6 +373,7 @@ from boltz.analysis.interp import (
     plot_semantic_peaks,
     plot_geometric_peaks,
     plot_geo_head_correlation_heatmap,
+    plot_bias_correlation_gallery,
     plot_structure_vs_top_geo_bias,
     plot_bias_sampled_layers,
 )
@@ -409,6 +410,7 @@ FIG_SIZES = {
     "rq1_geo_peaks_line": (5, 5),
     "rq1_geo_peaks_bars": None,
     "rq1_corr":           None,
+    "rq1_corr_gallery":   None,
     "rq2_struct":         None,
     "rq2_sampled":        None,
     "overlay":            (14, 8),
@@ -533,13 +535,24 @@ def process_example(example):
     )
 
     # ── RQ1-5  Bias–structure correlation heatmap ─────────────────────
-    plot_geo_head_correlation_heatmap(
+    _, corr_mat = plot_geo_head_correlation_heatmap(
         acts, layer_names, ca_dist, res_names, geo_ratio,
         geo_threshold=GEO_THRESHOLD,
         save_path=sp("rq1_geo_corr_heatmap"),
         figsize=FIG_SIZES["rq1_corr"],
         title=f"Bias–structure correlation (geo heads >{GEO_THRESHOLD:.0%})  —  {label}",
     )
+
+    # ── RQ1-6  Bias correlation gallery ───────────────────────────────
+    if corr_mat is not None and (~np.isnan(corr_mat)).sum() >= 3:
+        plot_bias_correlation_gallery(
+            acts, layer_names, res_names, corr_mat,
+            geo_threshold=GEO_THRESHOLD,
+            zoom=min(80, len(res_names)),
+            save_path=sp("rq1_corr_gallery"),
+            figsize=FIG_SIZES["rq1_corr_gallery"],
+            title=f"Bias–structure correlation gallery  —  {label}",
+        )
 
     # ── RQ2-1  Structure proximity vs bias attention ───────────────────
     plot_structure_vs_top_geo_bias(
@@ -561,6 +574,53 @@ def process_example(example):
         figsize=FIG_SIZES["rq2_sampled"],
         suptitle=f"Geometric attention across model depth  —  {label}",
     )
+
+    # ── Summary text file ─────────────────────────────────────────────
+    num_heads   = geo_raw.shape[1]
+    valid_corrs = corr_mat[~np.isnan(corr_mat)]
+    n_geo_heads = int((geo_ratio > GEO_THRESHOLD).sum())
+
+    # Best correlated head (highest Spearman r)
+    if valid_corrs.size > 0:
+        best_flat   = int(np.nanargmax(corr_mat))
+        best_layer  = layer_labels[best_flat // num_heads]
+        best_head   = best_flat % num_heads
+        best_r      = float(np.nanmax(corr_mat))
+        corr_mean   = float(valid_corrs.mean())
+        corr_std    = float(valid_corrs.std())
+    else:
+        best_layer = best_head = best_r = corr_mean = corr_std = float("nan")
+
+    summary_lines = [
+        f"Structure summary: {label} ({example})",
+        f"{'='*50}",
+        f"Residues / tokens : {len(res_names)}",
+        f"Pairformer layers  : {len(layer_names)}",
+        f"Attention heads    : {num_heads}",
+        f"",
+        f"── KL divergence (raw) ──────────────────────────",
+        f"  Mean geo KL        : {geo_raw.mean():.4f}",
+        f"  Mean sem KL        : {sem_raw.mean():.4f}",
+        f"  Geo / (geo+sem)    : {geo_ratio.mean():.4f}",
+        f"  Sem / (geo+sem)    : {sem_ratio.mean():.4f}",
+        f"",
+        f"── Raw KL (95th-pct normalised) ─────────────────",
+        f"  Mean geo (norm.)   : {geo_norm.mean():.4f}",
+        f"  Mean sem (norm.)   : {sem_norm.mean():.4f}",
+        f"",
+        f"── Bias–structure Spearman r (geo threshold {GEO_THRESHOLD:.0%}) ──",
+        f"  Geo heads above threshold : {n_geo_heads} / {len(layer_names) * num_heads}",
+        f"  Mean Spearman r    : {corr_mean:.4f}",
+        f"  Std  Spearman r    : {corr_std:.4f}",
+        f"  Best head          : layer {best_layer}, head {best_head}  (r = {best_r:.4f})",
+    ]
+
+    summary_path = sp("summary")
+    # Strip .png added by sp() — we want .txt
+    summary_path = summary_path.replace(".png", ".txt")
+    with open(summary_path, "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    print(f"  Summary → {summary_path}")
 
     print(f"  All figures saved to {out_dir}")
     return sem_line_ratio, sem_line_raw, geo_line_ratio, geo_line_raw
