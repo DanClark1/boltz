@@ -2399,7 +2399,7 @@ def plot_bias_correlation_gallery(
                 alpha=0.80,
                 zorder=10,
                 clip_on=False,
-                shrinkB=42,          # stop before the title text
+                shrinkB=52,          # stop before the title text
             )
             fig.add_artist(con)
 
