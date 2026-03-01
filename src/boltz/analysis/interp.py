@@ -2315,7 +2315,7 @@ def plot_bias_correlation_gallery(
         # the dashed connector lines to the outer matrices.
         gs = fig.add_gridspec(
             2, 3,
-            height_ratios=[1.8, 1.0],
+            height_ratios=[1.0, 1.0],
             hspace=0.60, wspace=0.38,
             left=0.07, right=0.96, top=0.90, bottom=0.06,
         )
@@ -2399,6 +2399,7 @@ def plot_bias_correlation_gallery(
                 alpha=0.80,
                 zorder=10,
                 clip_on=False,
+                shrinkB=42,          # stop before the title text
             )
             fig.add_artist(con)
 
