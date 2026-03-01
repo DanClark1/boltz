@@ -2307,11 +2307,12 @@ def plot_bias_correlation_gallery(
     layer_labels = [_layer_idx_from_name(n) for n in layer_names]
 
     with plt.rc_context(_ACADEMIC_RC):
-        fs  = figsize if figsize is not None else (15, 11)
+        fs  = figsize if figsize is not None else (12, 11)
         fig = plt.figure(figsize=fs)
 
-        # Two rows: heatmap (taller) + 3 matrices; explicit margins to give
-        # space for the connector lines between the rows.
+        # Two rows: heatmap (same width as one matrix, centred) + 3 matrices.
+        # Row 0 col 1 only is used; cols 0 and 2 are empty to leave space for
+        # the dashed connector lines to the outer matrices.
         gs = fig.add_gridspec(
             2, 3,
             height_ratios=[1.8, 1.0],
@@ -2319,8 +2320,8 @@ def plot_bias_correlation_gallery(
             left=0.07, right=0.96, top=0.90, bottom=0.06,
         )
 
-        # ── Top row: correlation heatmap ──────────────────────────────
-        ax_heat = fig.add_subplot(gs[0, :])
+        # ── Top row: correlation heatmap (centre column only) ─────────
+        ax_heat = fig.add_subplot(gs[0, 1])
 
         cmap_heat = plt.cm.RdBu_r.copy()
         cmap_heat.set_bad("black")
