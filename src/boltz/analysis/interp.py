@@ -2343,7 +2343,8 @@ def plot_bias_correlation_gallery(
         ax_cont = fig.add_subplot(gs[0, 0:2])
         if prox_mat is not None:
             N_p  = min(prox_mat.shape[0], len(res_names), zoom)
-            pm   = prox_mat[:N_p, :N_p]
+            pm   = prox_mat[:N_p, :N_p].copy()
+            np.fill_diagonal(pm, 0)
             im_c = ax_cont.imshow(pm, cmap="Greens", aspect="auto",
                                   interpolation="nearest", vmin=0, vmax=pm.max())
             cb_c = fig.colorbar(im_c, ax=ax_cont, fraction=0.046, pad=0.04)
