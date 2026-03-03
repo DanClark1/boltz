@@ -373,6 +373,7 @@ from boltz.analysis.interp import (
     plot_semantic_peaks,
     plot_geometric_peaks,
     plot_geo_head_correlation_heatmap,
+    plot_diagonal_head_correlation_heatmap,
     plot_bias_correlation_gallery,
     plot_structure_vs_top_geo_bias,
     plot_bias_sampled_layers,
@@ -410,6 +411,7 @@ FIG_SIZES = {
     "rq1_geo_peaks_line": (5, 5),
     "rq1_geo_peaks_bars": None,
     "rq1_corr":           None,
+    "rq1_diag_corr":      None,
     "rq1_corr_gallery":   None,
     "rq2_struct":         None,
     "rq2_sampled":        None,
@@ -543,6 +545,23 @@ def process_example(example):
         title=f"Bias–structure correlation (geo heads >{GEO_THRESHOLD:.0%})  —  {label}",
     )
 
+    # ── RQ1-5b Bias–diagonal (sequential) correlation heatmap ─────────
+    # All heads (no threshold)
+    _, diag_corr_mat_all = plot_diagonal_head_correlation_heatmap(
+        acts, layer_names, res_names,
+        save_path=sp("rq1_diag_corr_heatmap_all"),
+        figsize=FIG_SIZES["rq1_diag_corr"],
+        title=f"Bias–diagonal correlation (all heads)  —  {label}",
+    )
+    # Geo-thresholded heads only
+    _, diag_corr_mat = plot_diagonal_head_correlation_heatmap(
+        acts, layer_names, res_names, geo_ratio,
+        geo_threshold=GEO_THRESHOLD,
+        save_path=sp("rq1_diag_corr_heatmap_geo"),
+        figsize=FIG_SIZES["rq1_diag_corr"],
+        title=f"Bias–diagonal correlation (geo heads >{GEO_THRESHOLD:.0%})  —  {label}",
+    )
+
     # ── RQ1-6  Bias correlation gallery ───────────────────────────────
     if corr_mat is not None and (~np.isnan(corr_mat)).sum() >= 3:
         prox_mat = 1.0 / (ca_dist + 1.0)
@@ -584,16 +603,40 @@ def process_example(example):
     n_geo_heads = int((geo_ratio > GEO_THRESHOLD).sum())
 
     # Best correlated head (highest Spearman r)
+    n_total_heads   = len(layer_names) * num_heads
+    SEQ_R_THRESHOLD = 0.5   # |r| below this → head is "sequential" not structural
     if valid_corrs.size > 0:
-        best_flat   = int(np.nanargmax(corr_mat))
-        best_layer  = layer_labels[best_flat // num_heads]
-        best_head   = best_flat % num_heads
+        best_flat     = int(np.nanargmax(corr_mat))
+        best_layer    = layer_labels[best_flat // num_heads]
+        best_head     = best_flat % num_heads
         best_r        = float(np.nanmax(corr_mat))
         corr_mean     = float(valid_corrs.mean())
         corr_std      = float(valid_corrs.std())
         corr_mean_abs = float(np.abs(valid_corrs).mean())
+        n_sequential  = int((np.abs(valid_corrs) < SEQ_R_THRESHOLD).sum())
     else:
         best_layer = best_head = best_r = corr_mean = corr_std = corr_mean_abs = float("nan")
+        n_sequential = 0
+
+    # Diagonal (sequential) correlation stats — all heads
+    valid_diag_all = diag_corr_mat_all[~np.isnan(diag_corr_mat_all)]
+    if valid_diag_all.size > 0:
+        diag_all_mean     = float(valid_diag_all.mean())
+        diag_all_mean_abs = float(np.abs(valid_diag_all).mean())
+        n_diag_strong_all = int((np.abs(valid_diag_all) >= SEQ_R_THRESHOLD).sum())
+    else:
+        diag_all_mean = diag_all_mean_abs = float("nan")
+        n_diag_strong_all = 0
+
+    # Diagonal (sequential) correlation stats — geo heads only
+    valid_diag = diag_corr_mat[~np.isnan(diag_corr_mat)]
+    if valid_diag.size > 0:
+        diag_mean     = float(valid_diag.mean())
+        diag_mean_abs = float(np.abs(valid_diag).mean())
+        n_diag_strong = int((np.abs(valid_diag) >= SEQ_R_THRESHOLD).sum())
+    else:
+        diag_mean = diag_mean_abs = float("nan")
+        n_diag_strong = 0
 
     summary_lines = [
         f"Structure summary: {label} ({example})",
@@ -613,11 +656,23 @@ def process_example(example):
         f"  Mean sem (norm.)   : {sem_norm.mean():.4f}",
         f"",
         f"── Bias–structure Spearman r (geo threshold {GEO_THRESHOLD:.0%}) ──",
-        f"  Geo heads above threshold : {n_geo_heads} / {len(layer_names) * num_heads}",
+        f"  Total heads        : {n_total_heads}  ({len(layer_names)} layers × {num_heads} heads)",
+        f"  Geo heads (ratio ≥ {GEO_THRESHOLD:.0%})  : {n_geo_heads} / {n_total_heads}",
+        f"  Sequential geo heads (|r| < {SEQ_R_THRESHOLD})  : {n_sequential} / {n_geo_heads}",
         f"  Mean Spearman r    : {corr_mean:.4f}",
         f"  Mean |Spearman r|  : {corr_mean_abs:.4f}",
         f"  Std  Spearman r    : {corr_std:.4f}",
         f"  Best head          : layer {best_layer}, head {best_head}  (r = {best_r:.4f})",
+        f"",
+        f"── Bias–diagonal Spearman r (all heads) ────────",
+        f"  Mean Spearman r    : {diag_all_mean:.4f}",
+        f"  Mean |Spearman r|  : {diag_all_mean_abs:.4f}",
+        f"  Diagonal heads (|r| ≥ {SEQ_R_THRESHOLD})  : {n_diag_strong_all} / {n_total_heads}",
+        f"",
+        f"── Bias–diagonal Spearman r (geo threshold {GEO_THRESHOLD:.0%}) ──",
+        f"  Mean Spearman r    : {diag_mean:.4f}",
+        f"  Mean |Spearman r|  : {diag_mean_abs:.4f}",
+        f"  Diagonal geo heads (|r| ≥ {SEQ_R_THRESHOLD})  : {n_diag_strong} / {n_geo_heads}",
     ]
 
     summary_path = sp("summary")

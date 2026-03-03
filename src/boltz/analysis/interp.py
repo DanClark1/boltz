@@ -2229,7 +2229,113 @@ def plot_geo_head_correlation_heatmap(
 
 
 # ---------------------------------------------------------------------------
-# 14. Bias-correlation gallery
+# 14. Diagonal (sequential) head correlation heatmap
+# ---------------------------------------------------------------------------
+
+def plot_diagonal_head_correlation_heatmap(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    geo_scores: Optional[np.ndarray] = None,
+    geo_threshold: float = 0.5,
+    save_path: Optional[str] = None,
+    figsize: Optional[tuple[float, float]] = None,
+    title: Optional[str] = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """Spearman correlation between each head's bias attention and an identity matrix.
+
+    A high positive r indicates the head concentrates bias on the diagonal
+    (sequential / self-proximity encoding).  Uses the full matrix including
+    the diagonal, since the diagonal is the signal of interest here.
+
+    When ``geo_scores`` is provided, heads with score <= ``geo_threshold`` are
+    blacked out (NaN).  Pass ``geo_scores=None`` to evaluate every head.
+
+    Parameters
+    ----------
+    activations : dict
+        Single-step activations (output of :func:`get_recycling_step`).
+    layer_names : list[str]
+    res_names : list[str]
+    geo_scores : np.ndarray, shape ``[num_layers, num_heads]``, optional
+        Geometric scores for thresholding.  ``None`` = evaluate all heads.
+    geo_threshold : float
+        Heads with ``geo_scores <= geo_threshold`` are blacked out.  Default 0.5.
+        Ignored when ``geo_scores`` is ``None``.
+    save_path : str, optional
+    figsize : (width, height) in inches, optional
+    title : str, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    diag_corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
+        Spearman r values vs identity matrix; NaN for blacked-out heads.
+    """
+    # Infer num_heads from first layer's activations when geo_scores is absent
+    _first = activations[layer_names[0]]
+    _maps, _ = _get_attention_maps(_first, "bias")
+    num_layers = len(layer_names)
+    num_heads  = _maps.shape[0]
+
+    diag_corr_mat = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+
+    for i, name in enumerate(layer_names):
+        data         = activations[name]
+        attn_maps, _ = _get_attention_maps(data, "bias")
+        N = min(attn_maps.shape[-1], len(res_names))
+
+        diag_ref = np.eye(N).ravel()   # reference: 1 on diagonal, 0 elsewhere
+
+        for h in range(num_heads):
+            if geo_scores is not None and geo_scores[i, h] <= geo_threshold:
+                continue
+
+            bias_vec = attn_maps[h, :N, :N].ravel().astype(float)
+            diag_corr_mat[i, h] = _spearman(diag_ref, bias_vec)
+
+    layer_labels = [_layer_idx_from_name(n) for n in layer_names]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fs = figsize if figsize is not None else (
+            max(7, num_heads * 0.5 + 2),
+            max(5, num_layers * 0.18 + 2),
+        )
+        fig, ax = plt.subplots(figsize=fs)
+
+        cmap = plt.cm.RdBu_r.copy()
+        cmap.set_bad("black")
+
+        masked = np.ma.masked_invalid(diag_corr_mat)
+        im = ax.imshow(masked, cmap=cmap, vmin=-1, vmax=1, aspect="auto",
+                       interpolation="nearest")
+
+        step = max(1, num_layers // 10)
+        ax.set_yticks(range(0, num_layers, step))
+        ax.set_yticklabels([str(layer_labels[p]) for p in range(0, num_layers, step)])
+        ax.set_xticks(range(num_heads))
+        ax.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=8)
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer")
+        _title = title if title is not None else (
+            f"Bias–diagonal Spearman r  (geo heads, threshold={geo_threshold:.2f})\n"
+            "Black = below threshold"
+        )
+        ax.set_title(_title, pad=8)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+        cbar.set_label("Spearman r", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+        plt.tight_layout(pad=1.5)
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig, diag_corr_mat
+
+
+# ---------------------------------------------------------------------------
+# 15. Bias-correlation gallery
 # ---------------------------------------------------------------------------
 
 def plot_bias_correlation_gallery(
