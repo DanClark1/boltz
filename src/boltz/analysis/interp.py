@@ -1421,7 +1421,302 @@ def run_kl_analysis(
 
 
 # ---------------------------------------------------------------------------
-# 11. Academic publication plots  (RQ1 & RQ2)
+# 11. Scale-experiment utilities
+# ---------------------------------------------------------------------------
+
+def compute_scale_metrics(
+    activations: dict,
+    layer_names: list[str],
+    coords: torch.Tensor,
+    res_names: list[str],
+    num_kl_trials: int = 3,
+    seq_sep: int = 3,
+) -> dict:
+    """Compute compact per-protein metrics for scale experiments.
+
+    Designed to be called immediately after inference (with activations still
+    in memory), computing all key statistics then discarding the heavy tensors.
+    Only lightweight numpy arrays are returned.
+
+    Parameters
+    ----------
+    activations : dict
+        Single-step activations ``{layer: {'q', 'k', 'bias'}}``.
+    layer_names : list[str]
+        Ordered pairformer layer names (filtered to ``pairformer_module.*``).
+    coords : torch.Tensor
+        Predicted atom coordinates ``[diffusion_samples, num_atoms, 3]``.
+    res_names : list[str]
+        Residue names from :func:`decode_res_types`.
+    num_kl_trials : int
+        KL permutation trials.  3 is fast; 5 is more stable.
+    seq_sep : int
+        Minimum sequence separation for structure-correlation mask.
+
+    Returns
+    -------
+    dict
+        Keys: ``geo_raw``, ``sem_raw``, ``geo_ratio``, ``sem_ratio``,
+        ``struct_corr``, ``layer_indices``, ``n_residues`` — all small
+        numpy arrays suitable for ``np.savez()``.
+    """
+    geo_raw, sem_raw = run_kl_analysis(
+        activations, layer_names, num_trials=num_kl_trials
+    )
+
+    ca_coords = compute_ca_coords(coords, res_names, sample_idx=0)
+    ca_dist = compute_distance_matrix(ca_coords)
+    struct_corr = compute_layer_structure_correlations(
+        activations, layer_names, ca_dist, component="bias", seq_sep=seq_sep
+    )
+
+    total = geo_raw + sem_raw + 1e-10
+    geo_ratio = geo_raw / total
+    sem_ratio = sem_raw / total
+    layer_indices = np.array(
+        [_layer_idx_from_name(n) for n in layer_names], dtype=np.int32
+    )
+
+    return {
+        "geo_raw":      geo_raw,
+        "sem_raw":      sem_raw,
+        "geo_ratio":    geo_ratio,
+        "sem_ratio":    sem_ratio,
+        "struct_corr":  struct_corr,
+        "layer_indices": layer_indices,
+        "n_residues":   np.array(len(res_names), dtype=np.int32),
+    }
+
+
+def aggregate_scale_results(results_dir: str) -> dict:
+    """Load all per-protein ``.npz`` metric files and stack into arrays.
+
+    Parameters
+    ----------
+    results_dir : str
+        Directory containing ``.npz`` files produced by the scale loop.
+
+    Returns
+    -------
+    dict with keys:
+        ``proteins`` (list[str]),
+        ``geo_ratio``, ``sem_ratio``, ``struct_corr`` (shape ``[P, L, H]``),
+        ``n_residues`` (shape ``[P]``),
+        ``layer_indices`` (shape ``[L]``).
+    """
+    paths = sorted(Path(results_dir).glob("*.npz"))
+    if not paths:
+        raise FileNotFoundError(f"No .npz files found in {results_dir}")
+
+    proteins, geo_ratios, sem_ratios, struct_corrs, n_res = [], [], [], [], []
+    layer_indices = None
+
+    for p in paths:
+        data = np.load(p, allow_pickle=True)
+        L, H = data["geo_ratio"].shape
+        # Skip files with mismatched shapes (shouldn't happen, but be safe)
+        if geo_ratios and geo_ratios[0].shape != (L, H):
+            print(f"  [skip] {p.stem}: shape mismatch ({L},{H})")
+            continue
+        proteins.append(p.stem)
+        geo_ratios.append(data["geo_ratio"])
+        sem_ratios.append(data["sem_ratio"])
+        struct_corrs.append(data["struct_corr"])
+        n_res.append(int(data["n_residues"]))
+        if layer_indices is None:
+            layer_indices = data["layer_indices"]
+
+    return {
+        "proteins":      proteins,
+        "geo_ratio":     np.stack(geo_ratios,  axis=0),   # [P, L, H]
+        "sem_ratio":     np.stack(sem_ratios,  axis=0),   # [P, L, H]
+        "struct_corr":   np.stack(struct_corrs, axis=0),  # [P, L, H]
+        "n_residues":    np.array(n_res),                 # [P]
+        "layer_indices": layer_indices,                   # [L]
+    }
+
+
+def plot_scale_summary(
+    agg: dict,
+    geo_threshold: float = 0.5,
+    struct_threshold: float = 0.3,
+    save_dir: Optional[str] = None,
+) -> None:
+    """Publication-quality summary figures for the scale experiment.
+
+    Produces four figures:
+
+    1. Mean geo / sem ratio per layer (±std across proteins).
+    2. Mean bias–structure Spearman r per layer (±std).
+    3. Scatter: per-protein mean geo ratio and struct corr vs sequence length.
+    4. Aggregate layer×head heatmaps (mean over all proteins).
+
+    Parameters
+    ----------
+    agg : dict
+        Output of :func:`aggregate_scale_results`.
+    geo_threshold : float
+        geo_ratio above which a head counts as "geometric".
+    struct_threshold : float
+        struct_corr above which a head counts as "structure-attending".
+    save_dir : str, optional
+        If given, each figure is saved as a PNG here.
+    """
+    import os
+
+    geo_ratio   = agg["geo_ratio"]    # [P, L, H]
+    sem_ratio   = agg["sem_ratio"]
+    struct_corr = agg["struct_corr"]
+    n_residues  = agg["n_residues"]
+    layer_idxs  = agg["layer_indices"]
+    P, L, H     = geo_ratio.shape
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    with plt.rc_context(_ACADEMIC_RC):
+
+        # ── Figure 1: per-layer geo/sem mean ± std ────────────────────────
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        fig.suptitle(
+            f"Head specialisation across {P} proteins (mean ± std)", fontsize=13
+        )
+        for ax, ratio, label, color in [
+            (axes[0], geo_ratio, "Geometric ratio", "#E07B7B"),
+            (axes[1], sem_ratio, "Semantic ratio",  "#5B8DB8"),
+        ]:
+            per_prot = ratio.mean(axis=-1)          # [P, L]
+            mu  = per_prot.mean(axis=0)             # [L]
+            std = per_prot.std(axis=0)              # [L]
+            ax.plot(layer_idxs, mu, color=color, lw=2)
+            ax.fill_between(
+                layer_idxs, mu - std, mu + std, alpha=0.25, color=color
+            )
+            ax.set_xlabel("Layer")
+            ax.set_ylabel(label)
+            ax.set_title(label)
+            ax.grid(True, alpha=0.2)
+            ax.set_ylim(0, 1)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(
+                f"{save_dir}/scale_geo_sem_per_layer.png",
+                dpi=150, bbox_inches="tight",
+            )
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 2: per-layer struct_corr mean ± std ───────────────────
+        fig, ax = plt.subplots(figsize=(7, 4))
+        per_prot = struct_corr.mean(axis=-1)        # [P, L]
+        mu  = per_prot.mean(axis=0)
+        std = per_prot.std(axis=0)
+        ax.plot(layer_idxs, mu, color="#5BA85B", lw=2)
+        ax.fill_between(
+            layer_idxs, mu - std, mu + std, alpha=0.25, color="#5BA85B"
+        )
+        ax.axhline(0, color="gray", lw=0.8, ls="--")
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Spearman r (bias vs Cα proximity)")
+        ax.set_title(
+            f"Bias–structure correlation across {P} proteins (mean ± std)"
+        )
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(
+                f"{save_dir}/scale_struct_corr_per_layer.png",
+                dpi=150, bbox_inches="tight",
+            )
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 3: per-protein scatter vs length ───────────────────────
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        fig.suptitle("Per-protein summary statistics", fontsize=13)
+        mean_geo  = geo_ratio.mean(axis=(1, 2))    # [P]
+        mean_corr = struct_corr.mean(axis=(1, 2))  # [P]
+        for ax, y, ylabel, color in [
+            (axes[0], mean_geo,  "Mean geo ratio",       "#E07B7B"),
+            (axes[1], mean_corr, "Mean struct corr (r)", "#5BA85B"),
+        ]:
+            ax.scatter(
+                n_residues, y, alpha=0.7, color=color,
+                edgecolors="white", s=60,
+            )
+            ax.axhline(
+                y.mean(), color=color, lw=1.2, ls="--", alpha=0.7,
+                label=f"Mean = {y.mean():.3f}",
+            )
+            ax.set_xlabel("Sequence length (residues)")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{ylabel} vs protein length")
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(
+                f"{save_dir}/scale_per_protein_scatter.png",
+                dpi=150, bbox_inches="tight",
+            )
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 4: aggregate layer×head heatmaps ───────────────────────
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(
+            f"Head-level mean scores across {P} proteins", fontsize=13
+        )
+        vmax_corr = max(0.05, float(np.nanpercentile(struct_corr, 95)))
+        for ax, data, title, cmap, vmin, vmax in [
+            (axes[0], geo_ratio.mean(axis=0),   "Mean geo ratio",   "Reds",   0, 1),
+            (axes[1], struct_corr.mean(axis=0), "Mean struct corr", "Greens", 0, vmax_corr),
+        ]:
+            im = ax.imshow(
+                data, cmap=cmap, vmin=vmin, vmax=vmax,
+                aspect="auto", interpolation="nearest",
+            )
+            ax.set_xlabel("Head")
+            ax.set_ylabel("Layer")
+            ax.set_title(title)
+            step = max(1, L // 12)
+            ypos = list(range(0, L, step))
+            ax.set_yticks(ypos)
+            ax.set_yticklabels([str(layer_idxs[p]) for p in ypos])
+            plt.colorbar(im, ax=ax, shrink=0.85)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(
+                f"{save_dir}/scale_head_heatmaps.png",
+                dpi=150, bbox_inches="tight",
+            )
+        plt.show()
+        plt.close(fig)
+
+    # ── Print summary stats ───────────────────────────────────────────────
+    mean_geo  = geo_ratio.mean(axis=(1, 2))
+    mean_corr = struct_corr.mean(axis=(1, 2))
+    n_geo = int((geo_ratio > geo_threshold).sum())
+    n_str = int((struct_corr > struct_threshold).sum())
+    n_tot = geo_ratio.size
+
+    print(f"\n{'='*55}")
+    print(f"Scale experiment summary  ({P} proteins)")
+    print(f"{'='*55}")
+    print(f"  Proteins analysed    : {P}")
+    print(f"  Sequence lengths     : {n_residues.min()}–{n_residues.max()}"
+          f"  (median {int(np.median(n_residues))})")
+    print(f"  Mean geo ratio       : {mean_geo.mean():.4f} ± {mean_geo.std():.4f}")
+    print(f"  Mean struct corr r   : {mean_corr.mean():.4f} ± {mean_corr.std():.4f}")
+    print(f"  Geo heads (>{geo_threshold:.0%})  : {n_geo}/{n_tot}"
+          f"  ({100*n_geo/n_tot:.1f}%)")
+    print(f"  Struct heads (r>{struct_threshold}): {n_str}/{n_tot}"
+          f"  ({100*n_str/n_tot:.1f}%)")
+    print(f"{'='*55}")
+
+
+# ---------------------------------------------------------------------------
+# 12. Academic publication plots  (RQ1 & RQ2)
 # ---------------------------------------------------------------------------
 
 _ACADEMIC_RC: dict = {
