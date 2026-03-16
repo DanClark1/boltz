@@ -2537,11 +2537,11 @@ def plot_diagonal_head_correlation_heatmap(
     figsize: Optional[tuple[float, float]] = None,
     title: Optional[str] = None,
 ) -> tuple[plt.Figure, np.ndarray]:
-    """Spearman correlation between each head's bias attention and an identity matrix.
+    """Spearman correlation between each head's bias attention and sequence separation |i-j|.
 
-    A high positive r indicates the head concentrates bias on the diagonal
-    (sequential / self-proximity encoding).  Uses the full matrix including
-    the diagonal, since the diagonal is the signal of interest here.
+    A strongly negative r indicates the head concentrates high bias on close
+    sequence neighbours (sequential encoding), directly paralleling the structural
+    alignment metric (r_struct) which correlates with Cα distances.
 
     When ``geo_scores`` is provided, heads with score <= ``geo_threshold`` are
     blacked out (NaN).  Pass ``geo_scores=None`` to evaluate every head.
@@ -2564,8 +2564,9 @@ def plot_diagonal_head_correlation_heatmap(
     Returns
     -------
     fig : matplotlib.figure.Figure
-    diag_corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
-        Spearman r values vs identity matrix; NaN for blacked-out heads.
+    seq_corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
+        Spearman r values vs sequence separation |i-j|; NaN for blacked-out heads.
+        Negative values indicate sequential encoding (high bias at small |i-j|).
     """
     # Infer num_heads from first layer's activations when geo_scores is absent
     _first = activations[layer_names[0]]
@@ -2573,21 +2574,22 @@ def plot_diagonal_head_correlation_heatmap(
     num_layers = len(layer_names)
     num_heads  = _maps.shape[0]
 
-    diag_corr_mat = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+    seq_corr_mat = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
 
     for i, name in enumerate(layer_names):
         data         = activations[name]
         attn_maps, _ = _get_attention_maps(data, "bias")
         N = min(attn_maps.shape[-1], len(res_names))
 
-        diag_ref = np.eye(N).ravel()   # reference: 1 on diagonal, 0 elsewhere
+        idx = np.arange(N)
+        seq_sep_ref = np.abs(idx[:, None] - idx[None, :]).ravel().astype(float)
 
         for h in range(num_heads):
             if geo_scores is not None and geo_scores[i, h] <= geo_threshold:
                 continue
 
             bias_vec = attn_maps[h, :N, :N].ravel().astype(float)
-            diag_corr_mat[i, h] = _spearman(diag_ref, bias_vec)
+            seq_corr_mat[i, h] = _spearman(seq_sep_ref, bias_vec)
 
     layer_labels = [_layer_idx_from_name(n) for n in layer_names]
 
@@ -2601,7 +2603,7 @@ def plot_diagonal_head_correlation_heatmap(
         cmap = plt.cm.RdBu_r.copy()
         cmap.set_bad("black")
 
-        masked = np.ma.masked_invalid(diag_corr_mat)
+        masked = np.ma.masked_invalid(seq_corr_mat)
         im = ax.imshow(masked, cmap=cmap, vmin=-1, vmax=1, aspect="auto",
                        interpolation="nearest")
 
@@ -2613,12 +2615,12 @@ def plot_diagonal_head_correlation_heatmap(
         ax.set_xlabel("Head")
         ax.set_ylabel("Layer")
         _title = title if title is not None else (
-            f"Bias–diagonal Spearman r  (geo heads, threshold={geo_threshold:.2f})\n"
-            "Black = below threshold"
+            f"Bias–sequence-separation Spearman r  (geo heads, threshold={geo_threshold:.2f})\n"
+            "Negative = sequential encoding.  Black = below threshold"
         )
         ax.set_title(_title, pad=8)
         cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-        cbar.set_label("Spearman r", fontsize=10)
+        cbar.set_label("Spearman r (seq sep)", fontsize=10)
         cbar.ax.tick_params(labelsize=9)
 
         plt.tight_layout(pad=1.5)
@@ -2626,7 +2628,7 @@ def plot_diagonal_head_correlation_heatmap(
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.show()
 
-    return fig, diag_corr_mat
+    return fig, seq_corr_mat
 
 
 # ---------------------------------------------------------------------------
@@ -2839,6 +2841,193 @@ def plot_bias_correlation_gallery(
                 zorder=10,
                 clip_on=False,
                 shrinkB=42,          # stop before the title text
+            )
+            fig.add_artist(con)
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig, selected
+
+
+# ---------------------------------------------------------------------------
+# 15b. Sequential-encoding gallery
+# ---------------------------------------------------------------------------
+
+def plot_sequential_head_gallery(
+    activations: dict,
+    layer_names: list[str],
+    res_names: list[str],
+    seq_corr_mat: np.ndarray,
+    zoom: int = 80,
+    save_path: Optional[str] = None,
+    figsize: Optional[tuple[float, float]] = None,
+    title: Optional[str] = None,
+) -> tuple[plt.Figure, dict]:
+    """Gallery figure for sequential-encoding heads.
+
+    Mirrors :func:`plot_bias_correlation_gallery` but uses the sequence-separation
+    Spearman r (output of :func:`plot_diagonal_head_correlation_heatmap`).
+
+    Layout (6-column grid):
+
+    ``[seq-sep reference cols 0-1] [seq corr heatmap cols 3-4]``
+    ``[matrix strong] [matrix mid] [matrix weak]``
+
+    The three heads selected are:
+    - **Strong**: most negative r (clearest sequential encoding)
+    - **Mid**: closest to median r
+    - **Weak**: least negative / most positive r
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    res_names : list[str]
+    seq_corr_mat : np.ndarray, shape ``[num_layers, num_heads]``
+        Output of :func:`plot_diagonal_head_correlation_heatmap`.
+        NaN entries are excluded.
+    zoom : int
+        Crop bias matrices and reference to first *zoom* residues.
+    save_path : str, optional
+    figsize : (width, height) in inches, optional  Default ``(16, 11)``.
+    title : str, optional
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    selected : dict
+        ``{'strong': (layer_i, head_i, r), 'mid': ..., 'weak': ...}``
+    """
+    valid_mask = ~np.isnan(seq_corr_mat)
+    if valid_mask.sum() < 3:
+        raise ValueError(
+            f"Fewer than 3 valid heads found ({valid_mask.sum()}); cannot build gallery."
+        )
+
+    valid_idxs  = np.argwhere(valid_mask)
+    valid_vals  = seq_corr_mat[valid_mask]
+    sorted_ord  = np.argsort(valid_vals)           # ascending: most-negative first
+    sorted_idxs = valid_idxs[sorted_ord]
+    sorted_vals = valid_vals[sorted_ord]
+
+    n_valid  = len(sorted_vals)
+    mid_rank = int(np.argmin(np.abs(sorted_vals - np.median(sorted_vals))))
+    sel_ranks = [0, mid_rank, n_valid - 1]
+
+    selected: dict = {}
+    for rank, tag in zip(sel_ranks, ["strong", "mid", "weak"]):
+        li, hi = sorted_idxs[rank]
+        selected[tag] = (int(li), int(hi), float(sorted_vals[rank]))
+
+    sel_labels = ["Strong Sequential", "Mid Sequential", "Weak Sequential"]
+    sel_colors = ["#1565C0", "#6A1B9A", "#BF360C"]   # blue / purple / burnt-orange
+
+    num_layers, num_heads = seq_corr_mat.shape
+    layer_labels = [_layer_idx_from_name(n) for n in layer_names]
+    N_zoom = min(zoom, len(res_names))
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fs  = figsize if figsize is not None else (16, 11)
+        fig = plt.figure(figsize=fs)
+
+        gs = fig.add_gridspec(
+            2, 6,
+            height_ratios=[1.0, 1.0],
+            hspace=0.65, wspace=0.45,
+            left=0.07, right=0.96, top=0.90, bottom=0.06,
+        )
+
+        # ── Top-left: sequence-separation reference ───────────────────────
+        ax_ref = fig.add_subplot(gs[0, 0:2])
+        idx     = np.arange(N_zoom)
+        sep_mat = np.abs(idx[:, None] - idx[None, :]).astype(float)
+        im_r = ax_ref.imshow(sep_mat, cmap="YlOrRd", aspect="auto",
+                             interpolation="nearest")
+        cb_r = fig.colorbar(im_r, ax=ax_ref, fraction=0.046, pad=0.04)
+        cb_r.set_label("|i − j|", fontsize=9)
+        cb_r.ax.tick_params(labelsize=8)
+        ax_ref.set_xlabel("Residue", fontsize=9)
+        ax_ref.set_ylabel("Residue", fontsize=9)
+        ax_ref.set_title("Sequence separation  |i − j|", pad=10)
+
+        # ── Top-right: seq-corr heatmap ───────────────────────────────────
+        ax_heat = fig.add_subplot(gs[0, 3:5])
+        cmap_heat = plt.cm.RdBu_r.copy()
+        cmap_heat.set_bad("black")
+        masked = np.ma.masked_invalid(seq_corr_mat)
+        im_h = ax_heat.imshow(masked, cmap=cmap_heat, vmin=-1, vmax=1,
+                              aspect="auto", interpolation="nearest")
+
+        step = max(1, num_layers // 10)
+        ax_heat.set_yticks(range(0, num_layers, step))
+        ax_heat.set_yticklabels(
+            [str(layer_labels[p]) for p in range(0, num_layers, step)]
+        )
+        ax_heat.set_xticks(range(num_heads))
+        ax_heat.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=9)
+        ax_heat.set_xlabel("Attention head", labelpad=6)
+        ax_heat.set_ylabel("Layer", labelpad=6)
+
+        _title = title if title is not None else (
+            "Bias–seq-separation Spearman r\n"
+            "Negative = sequential encoding   black = below threshold"
+        )
+        ax_heat.set_title(_title, pad=10)
+
+        cbar = fig.colorbar(im_h, ax=ax_heat, fraction=0.046, pad=0.04)
+        cbar.set_label("Spearman r (seq sep)", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+        for (li, hi, _), color in zip(selected.values(), sel_colors):
+            rect = plt.Rectangle(
+                (hi - 0.5, li - 0.5), 1, 1,
+                linewidth=2.5, edgecolor=color, facecolor="none", zorder=5,
+            )
+            ax_heat.add_patch(rect)
+
+        # ── Bottom row: one bias matrix per selected head ─────────────────
+        bias_axes = [fig.add_subplot(gs[1, c*2 : c*2+2]) for c in range(3)]
+
+        for ax_b, (tag, (li, hi, r_val)), lbl, color in zip(
+            bias_axes, selected.items(), sel_labels, sel_colors
+        ):
+            data         = activations[layer_names[li]]
+            attn_maps, _ = _get_attention_maps(data, "bias")
+            N   = min(attn_maps.shape[-1], len(res_names), zoom)
+            mat = attn_maps[hi, :N, :N]
+
+            im_b = ax_b.imshow(mat, cmap="viridis", aspect="auto",
+                               interpolation="nearest", vmin=0)
+            ax_b.set_title(
+                f"{lbl}\nLayer {layer_labels[li]}, Head {hi}   r = {r_val:.3f}",
+                fontsize=10, color=color, pad=8,
+            )
+            ax_b.set_xlabel("Residue", fontsize=9)
+            ax_b.set_ylabel("Residue", fontsize=9)
+
+            for spine in ax_b.spines.values():
+                spine.set_edgecolor(color)
+                spine.set_linewidth(2.0)
+
+            cb = fig.colorbar(im_b, ax=ax_b, fraction=0.046, pad=0.04)
+            cb.ax.tick_params(labelsize=8)
+
+            con = mpatches.ConnectionPatch(
+                xyA=(hi, li),
+                xyB=(0.5, 1.0),
+                coordsA="data",
+                coordsB="axes fraction",
+                axesA=ax_heat,
+                axesB=ax_b,
+                color=color,
+                lw=1.5,
+                ls=(0, (5, 4)),
+                alpha=0.80,
+                zorder=10,
+                clip_on=False,
+                shrinkB=42,
             )
             fig.add_artist(con)
 
