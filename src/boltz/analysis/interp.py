@@ -3358,3 +3358,340 @@ def plot_toeplitz_gallery(
         plt.show()
 
     return fig, selected
+
+
+# ---------------------------------------------------------------------------
+# 15d. Fraction of attention mass within a sequence window
+# ---------------------------------------------------------------------------
+
+def compute_seq_window_mass(
+    activations: dict,
+    layer_names: list,
+    res_names: list,
+    windows=(5, 15, 30),
+    geo_scores=None,
+    geo_threshold: float = 0.5,
+) -> dict:
+    """Fraction of softmax attention mass within ±k sequence positions.
+
+    For each head, the bias matrix is converted to row-wise softmax attention
+    weights, then for each row i the fraction of weight at columns j where
+    |i-j| <= k is averaged over all rows.  Sequential encoder heads
+    concentrate mass near the diagonal and will show high values.
+
+    A value of 0.8 means 80% of the attention weight falls within k positions
+    of the query residue — more interpretable than a correlation coefficient.
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    res_names : list[str]
+    windows : tuple of int
+        Sequence offsets k to evaluate (e.g. (5, 15, 30)).
+    geo_scores : np.ndarray ``[num_layers, num_heads]``, optional
+        Heads with score <= *geo_threshold* are set to NaN.
+    geo_threshold : float
+
+    Returns
+    -------
+    mass : dict[int, np.ndarray ``[num_layers, num_heads]``]
+        Values in [0, 1]; NaN for excluded heads.
+    """
+    from scipy.special import softmax as _softmax
+
+    _first = activations[layer_names[0]]
+    _maps, _ = _get_attention_maps(_first, "bias")
+    num_layers = len(layer_names)
+    num_heads  = _maps.shape[0]
+
+    mass = {k: np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+            for k in windows}
+
+    for i, name in enumerate(layer_names):
+        data         = activations[name]
+        attn_maps, _ = _get_attention_maps(data, "bias")
+        N = min(attn_maps.shape[-1], len(res_names))
+
+        idx = np.arange(N)
+        sep = np.abs(idx[:, None] - idx[None, :])   # [N, N]
+
+        for h in range(num_heads):
+            if geo_scores is not None and geo_scores[i, h] <= geo_threshold:
+                continue
+
+            bias = attn_maps[h, :N, :N].astype(float)
+            attn = _softmax(bias, axis=-1)           # [N, N] row-wise softmax
+
+            for k in windows:
+                row_mass = (attn * (sep <= k)).sum(axis=1)  # [N]
+                mass[k][i, h] = float(row_mass.mean())
+
+    return mass
+
+
+def plot_seq_window_mass_heatmaps(
+    mass: dict,
+    layer_names: list,
+    windows=None,
+    save_path=None,
+    figsize=None,
+    title_prefix: str = "",
+):
+    """One heatmap panel per window size k, arranged in a single figure row.
+
+    Parameters
+    ----------
+    mass : dict
+        Output of :func:`compute_seq_window_mass`.
+    layer_names : list[str]
+    windows : tuple of int, optional
+        Subset of keys to plot; defaults to all keys sorted.
+    save_path : str, optional
+    figsize : (w, h), optional  Default scales with number of panels.
+    title_prefix : str
+
+    Returns
+    -------
+    fig : plt.Figure
+    mats : list of np.ndarray  (one per window, same order as *windows*)
+    """
+    ks = sorted(mass.keys()) if windows is None else list(windows)
+    n_panels = len(ks)
+    num_layers, num_heads = next(iter(mass.values())).shape
+    layer_labels = [_layer_idx_from_name(n) for n in layer_names]
+
+    with plt.rc_context(_ACADEMIC_RC):
+        panel_w = max(4, num_heads * 0.45 + 1.5)
+        panel_h = max(4, num_layers * 0.18 + 1.5)
+        fs = figsize if figsize is not None else (panel_w * n_panels + 0.5, panel_h)
+        fig, axes = plt.subplots(1, n_panels, figsize=fs, squeeze=False)
+
+        cmap = plt.cm.YlOrRd.copy()
+        cmap.set_bad("black")
+
+        for ax, k in zip(axes[0], ks):
+            masked = np.ma.masked_invalid(mass[k])
+            im = ax.imshow(masked, cmap=cmap, vmin=0, vmax=1, aspect="auto",
+                           interpolation="nearest")
+
+            step = max(1, num_layers // 10)
+            ax.set_yticks(range(0, num_layers, step))
+            ax.set_yticklabels([str(layer_labels[p]) for p in range(0, num_layers, step)])
+            ax.set_xticks(range(num_heads))
+            ax.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=8)
+            ax.set_xlabel("Head")
+            ax.set_ylabel("Layer")
+            pfx = f"{title_prefix}  " if title_prefix else ""
+            ax.set_title(f"{pfx}Window ±{k}\nMean attn mass", pad=8)
+
+            cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+            cbar.set_label("Fraction", fontsize=9)
+            cbar.ax.tick_params(labelsize=8)
+
+        plt.tight_layout(pad=1.5)
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig, [mass[k] for k in ks]
+
+
+def plot_seq_window_mass_gallery(
+    activations: dict,
+    layer_names: list,
+    res_names: list,
+    mass: dict,
+    window: int = 15,
+    zoom: int = 80,
+    save_path=None,
+    figsize=None,
+    title=None,
+):
+    """Gallery for window-mass heads using a single window size k.
+
+    Layout (6-column grid):
+
+    ``[band-mass decay profile  cols 0-1] [mass heatmap  cols 3-4]``
+    ``[matrix high] [matrix mid] [matrix low]``
+
+    The top-left panel plots mean attention weight vs sequence separation
+    |i-j| for the highest-mass head, with the ±k window shaded.
+
+    Parameters
+    ----------
+    activations : dict
+    layer_names : list[str]
+    res_names : list[str]
+    mass : dict
+        Output of :func:`compute_seq_window_mass`.
+    window : int
+        Which window key to use for head selection and heatmap.
+    zoom : int
+    save_path : str, optional
+    figsize : (w, h), optional  Default ``(16, 11)``.
+    title : str, optional
+
+    Returns
+    -------
+    fig : plt.Figure
+    selected : dict
+        ``{'high': (layer_i, head_i, mass_val), 'mid': ..., 'low': ...}``
+    """
+    from scipy.special import softmax as _softmax
+
+    mass_mat   = mass[window]
+    valid_mask = ~np.isnan(mass_mat)
+    if valid_mask.sum() < 3:
+        raise ValueError(
+            f"Fewer than 3 valid heads ({valid_mask.sum()}); cannot build gallery."
+        )
+
+    valid_idxs  = np.argwhere(valid_mask)
+    valid_vals  = mass_mat[valid_mask]
+    sorted_ord  = np.argsort(valid_vals)[::-1]
+    sorted_idxs = valid_idxs[sorted_ord]
+    sorted_vals = valid_vals[sorted_ord]
+
+    n_valid  = len(sorted_vals)
+    mid_rank = int(np.argmin(np.abs(sorted_vals - np.median(sorted_vals))))
+    sel_ranks = [0, mid_rank, n_valid - 1]
+
+    selected = {}
+    for rank, tag in zip(sel_ranks, ["high", "mid", "low"]):
+        li, hi = sorted_idxs[rank]
+        selected[tag] = (int(li), int(hi), float(sorted_vals[rank]))
+
+    sel_labels = [f"High mass (\u00b1{window})", f"Mid mass (\u00b1{window})", f"Low mass (\u00b1{window})"]
+    sel_colors = ["#1565C0", "#6A1B9A", "#BF360C"]
+
+    num_layers, num_heads = mass_mat.shape
+    layer_labels = [_layer_idx_from_name(n) for n in layer_names]
+
+    # Band-mass decay profile for the best head
+    hi_li, hi_hi, _ = selected["high"]
+    hi_data          = activations[layer_names[hi_li]]
+    hi_maps, _       = _get_attention_maps(hi_data, "bias")
+    N_ref            = min(hi_maps.shape[-1], len(res_names), zoom)
+    hi_attn          = _softmax(hi_maps[hi_hi, :N_ref, :N_ref].astype(float), axis=-1)
+    idx              = np.arange(N_ref)
+    sep_mat          = np.abs(idx[:, None] - idx[None, :])
+    profile_lags     = np.arange(N_ref)
+    profile_vals     = np.array([
+        hi_attn[sep_mat == lag].mean() if (sep_mat == lag).any() else 0.0
+        for lag in profile_lags
+    ])
+
+    with plt.rc_context(_ACADEMIC_RC):
+        fs  = figsize if figsize is not None else (16, 11)
+        fig = plt.figure(figsize=fs)
+
+        gs = fig.add_gridspec(
+            2, 6,
+            height_ratios=[1.0, 1.0],
+            hspace=0.65, wspace=0.45,
+            left=0.07, right=0.96, top=0.90, bottom=0.06,
+        )
+
+        # Top-left: band-mass decay profile
+        ax_prof = fig.add_subplot(gs[0, 0:2])
+        ax_prof.plot(profile_lags, profile_vals, lw=1.5, color="#1565C0")
+        ax_prof.axvline(window, color="red", lw=1.2, ls="--",
+                        label=f"\u00b1{window} cutoff")
+        ax_prof.fill_between(profile_lags, profile_vals,
+                             where=(profile_lags <= window),
+                             alpha=0.25, color="#1565C0")
+        ax_prof.set_xlabel("Sequence separation  |i \u2212 j|", fontsize=9)
+        ax_prof.set_ylabel("Mean attention weight", fontsize=9)
+        ax_prof.set_title(
+            f"Band-mass profile\n"
+            f"Layer {layer_labels[hi_li]}, Head {hi_hi}"
+            f"  (mass = {selected['high'][2]:.3f})",
+            pad=10,
+        )
+        ax_prof.legend(fontsize=8)
+
+        # Top-right: mass heatmap
+        ax_heat = fig.add_subplot(gs[0, 3:5])
+        cmap_heat = plt.cm.YlOrRd.copy()
+        cmap_heat.set_bad("black")
+        masked = np.ma.masked_invalid(mass_mat)
+        im_h = ax_heat.imshow(masked, cmap=cmap_heat, vmin=0, vmax=1,
+                              aspect="auto", interpolation="nearest")
+
+        step = max(1, num_layers // 10)
+        ax_heat.set_yticks(range(0, num_layers, step))
+        ax_heat.set_yticklabels(
+            [str(layer_labels[p]) for p in range(0, num_layers, step)]
+        )
+        ax_heat.set_xticks(range(num_heads))
+        ax_heat.set_xticklabels([f"H{h}" for h in range(num_heads)], fontsize=9)
+        ax_heat.set_xlabel("Attention head", labelpad=6)
+        ax_heat.set_ylabel("Layer", labelpad=6)
+
+        _title = title if title is not None else (
+            f"Attention mass within \u00b1{window} positions\n"
+            "High = sequential encoder.  Black = below threshold"
+        )
+        ax_heat.set_title(_title, pad=10)
+
+        cbar = fig.colorbar(im_h, ax=ax_heat, fraction=0.046, pad=0.04)
+        cbar.set_label(f"Mass \u00b1{window}", fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+
+        for (li, hi, _), color in zip(selected.values(), sel_colors):
+            rect = plt.Rectangle(
+                (hi - 0.5, li - 0.5), 1, 1,
+                linewidth=2.5, edgecolor=color, facecolor="none", zorder=5,
+            )
+            ax_heat.add_patch(rect)
+
+        # Bottom row: bias matrices
+        bias_axes = [fig.add_subplot(gs[1, c*2 : c*2+2]) for c in range(3)]
+
+        for ax_b, (tag, (li, hi, mass_val)), lbl, color in zip(
+            bias_axes, selected.items(), sel_labels, sel_colors
+        ):
+            data         = activations[layer_names[li]]
+            attn_maps, _ = _get_attention_maps(data, "bias")
+            N   = min(attn_maps.shape[-1], len(res_names), zoom)
+            mat = attn_maps[hi, :N, :N]
+
+            im_b = ax_b.imshow(mat, cmap="viridis", aspect="auto",
+                               interpolation="nearest", vmin=0)
+            ax_b.set_title(
+                f"{lbl}\nLayer {layer_labels[li]}, Head {hi}   mass = {mass_val:.3f}",
+                fontsize=10, color=color, pad=8,
+            )
+            ax_b.set_xlabel("Residue", fontsize=9)
+            ax_b.set_ylabel("Residue", fontsize=9)
+
+            for spine in ax_b.spines.values():
+                spine.set_edgecolor(color)
+                spine.set_linewidth(2.0)
+
+            cb = fig.colorbar(im_b, ax=ax_b, fraction=0.046, pad=0.04)
+            cb.ax.tick_params(labelsize=8)
+
+            con = mpatches.ConnectionPatch(
+                xyA=(hi, li),
+                xyB=(0.5, 1.0),
+                coordsA="data",
+                coordsB="axes fraction",
+                axesA=ax_heat,
+                axesB=ax_b,
+                color=color,
+                lw=1.5,
+                ls=(0, (5, 4)),
+                alpha=0.80,
+                zorder=10,
+                clip_on=False,
+                shrinkB=42,
+            )
+            fig.add_artist(con)
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.show()
+
+    return fig, selected
