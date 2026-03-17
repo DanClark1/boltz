@@ -1457,9 +1457,13 @@ def compute_scale_metrics(
     -------
     dict
         Keys: ``geo_raw``, ``sem_raw``, ``geo_ratio``, ``sem_ratio``,
-        ``struct_corr``, ``layer_indices``, ``n_residues`` — all small
-        numpy arrays suitable for ``np.savez()``.
+        ``struct_corr``, ``seq_corr``, ``toeplitz``,
+        ``seq_mass_k5``, ``seq_mass_k15``, ``seq_mass_k30``,
+        ``layer_indices``, ``n_residues`` — all small numpy arrays
+        suitable for ``np.savez()``.
     """
+    from scipy.special import softmax as _softmax
+
     geo_raw, sem_raw = run_kl_analysis(
         activations, layer_names, num_trials=num_kl_trials
     )
@@ -1477,14 +1481,50 @@ def compute_scale_metrics(
         [_layer_idx_from_name(n) for n in layer_names], dtype=np.int32
     )
 
+    # ── Sequential encoding metrics ──────────────────────────────────────────
+    _first = activations[layer_names[0]]
+    _maps, _ = _get_attention_maps(_first, "bias")
+    L = len(layer_names)
+    H = _maps.shape[0]
+
+    seq_corr  = np.full((L, H), np.nan, dtype=np.float32)
+    toeplitz  = np.full((L, H), np.nan, dtype=np.float32)
+    mass_k5   = np.full((L, H), np.nan, dtype=np.float32)
+    mass_k15  = np.full((L, H), np.nan, dtype=np.float32)
+    mass_k30  = np.full((L, H), np.nan, dtype=np.float32)
+
+    for i, name in enumerate(layer_names):
+        attn_maps, _ = _get_attention_maps(activations[name], "bias")
+        N = min(attn_maps.shape[-1], len(res_names))
+
+        idx = np.arange(N)
+        sep = np.abs(idx[:, None] - idx[None, :])           # [N, N]
+        sep_ref = sep.ravel().astype(float)
+
+        for h in range(H):
+            mat  = attn_maps[h, :N, :N].astype(float)
+            bias_vec = mat.ravel()
+
+            seq_corr[i, h] = _spearman(sep_ref, bias_vec)
+            toeplitz[i, h] = _toeplitz_score(mat)
+
+            attn = _softmax(mat, axis=-1)
+            for k_val, arr in ((5, mass_k5), (15, mass_k15), (30, mass_k30)):
+                arr[i, h] = float((attn * (sep <= k_val)).sum(axis=1).mean())
+
     return {
-        "geo_raw":      geo_raw,
-        "sem_raw":      sem_raw,
-        "geo_ratio":    geo_ratio,
-        "sem_ratio":    sem_ratio,
-        "struct_corr":  struct_corr,
+        "geo_raw":       geo_raw,
+        "sem_raw":       sem_raw,
+        "geo_ratio":     geo_ratio,
+        "sem_ratio":     sem_ratio,
+        "struct_corr":   struct_corr,
+        "seq_corr":      seq_corr,
+        "toeplitz":      toeplitz,
+        "seq_mass_k5":   mass_k5,
+        "seq_mass_k15":  mass_k15,
+        "seq_mass_k30":  mass_k30,
         "layer_indices": layer_indices,
-        "n_residues":   np.array(len(res_names), dtype=np.int32),
+        "n_residues":    np.array(len(res_names), dtype=np.int32),
     }
 
 
@@ -1508,13 +1548,16 @@ def aggregate_scale_results(results_dir: str) -> dict:
     if not paths:
         raise FileNotFoundError(f"No .npz files found in {results_dir}")
 
-    proteins, geo_ratios, sem_ratios, struct_corrs, n_res = [], [], [], [], []
+    proteins   = []
+    geo_ratios, sem_ratios, struct_corrs = [], [], []
+    seq_corrs, toeplitzs = [], []
+    mass_k5s, mass_k15s, mass_k30s = [], [], []
+    n_res = []
     layer_indices = None
 
     for p in paths:
         data = np.load(p, allow_pickle=True)
         L, H = data["geo_ratio"].shape
-        # Skip files with mismatched shapes (shouldn't happen, but be safe)
         if geo_ratios and geo_ratios[0].shape != (L, H):
             print(f"  [skip] {p.stem}: shape mismatch ({L},{H})")
             continue
@@ -1522,17 +1565,28 @@ def aggregate_scale_results(results_dir: str) -> dict:
         geo_ratios.append(data["geo_ratio"])
         sem_ratios.append(data["sem_ratio"])
         struct_corrs.append(data["struct_corr"])
+        # Sequential metrics — optional for backwards compat with old .npz files
+        seq_corrs.append(data["seq_corr"]     if "seq_corr"     in data else np.full((L, H), np.nan))
+        toeplitzs.append(data["toeplitz"]     if "toeplitz"     in data else np.full((L, H), np.nan))
+        mass_k5s.append( data["seq_mass_k5"]  if "seq_mass_k5"  in data else np.full((L, H), np.nan))
+        mass_k15s.append(data["seq_mass_k15"] if "seq_mass_k15" in data else np.full((L, H), np.nan))
+        mass_k30s.append(data["seq_mass_k30"] if "seq_mass_k30" in data else np.full((L, H), np.nan))
         n_res.append(int(data["n_residues"]))
         if layer_indices is None:
             layer_indices = data["layer_indices"]
 
     return {
         "proteins":      proteins,
-        "geo_ratio":     np.stack(geo_ratios,  axis=0),   # [P, L, H]
-        "sem_ratio":     np.stack(sem_ratios,  axis=0),   # [P, L, H]
-        "struct_corr":   np.stack(struct_corrs, axis=0),  # [P, L, H]
-        "n_residues":    np.array(n_res),                 # [P]
-        "layer_indices": layer_indices,                   # [L]
+        "geo_ratio":     np.stack(geo_ratios,   axis=0),   # [P, L, H]
+        "sem_ratio":     np.stack(sem_ratios,   axis=0),   # [P, L, H]
+        "struct_corr":   np.stack(struct_corrs, axis=0),   # [P, L, H]
+        "seq_corr":      np.stack(seq_corrs,    axis=0),   # [P, L, H]
+        "toeplitz":      np.stack(toeplitzs,    axis=0),   # [P, L, H]
+        "seq_mass_k5":   np.stack(mass_k5s,     axis=0),   # [P, L, H]
+        "seq_mass_k15":  np.stack(mass_k15s,    axis=0),   # [P, L, H]
+        "seq_mass_k30":  np.stack(mass_k30s,    axis=0),   # [P, L, H]
+        "n_residues":    np.array(n_res),                  # [P]
+        "layer_indices": layer_indices,                    # [L]
     }
 
 
@@ -1712,6 +1766,191 @@ def plot_scale_summary(
           f"  ({100*n_geo/n_tot:.1f}%)")
     print(f"  Struct heads (r>{struct_threshold}): {n_str}/{n_tot}"
           f"  ({100*n_str/n_tot:.1f}%)")
+    print(f"{'='*55}")
+
+
+def plot_scale_sequential_summary(
+    agg: dict,
+    mass_threshold: float = 0.5,
+    toeplitz_threshold: float = 0.8,
+    save_dir: Optional[str] = None,
+) -> None:
+    """Publication-quality figures for the sequential-encoding scale metrics.
+
+    Produces five figures:
+
+    1. Seq-sep Spearman r per layer (mean ± std across proteins).
+    2. Toeplitz η² per layer (mean ± std).
+    3. Window mass per layer for k=5, 15, 30 (mean ± std), three lines.
+    4. Structural vs sequential scatter: r_struct vs r_seq per head (mean
+       over proteins), with marginal histograms — illustrates the trade-off.
+    5. Aggregate layer×head heatmaps for seq_corr, toeplitz, seq_mass_k15.
+
+    Parameters
+    ----------
+    agg : dict
+        Output of :func:`aggregate_scale_results` (must include sequential keys).
+    mass_threshold : float
+        Window-mass (k=15) above which a head is "sequential" for counting.
+    toeplitz_threshold : float
+        η² above which a head is "Toeplitz" for counting.
+    save_dir : str, optional
+        Each figure saved as PNG here when provided.
+    """
+    seq_corr    = agg["seq_corr"]      # [P, L, H]
+    toeplitz    = agg["toeplitz"]      # [P, L, H]
+    mass_k5     = agg["seq_mass_k5"]   # [P, L, H]
+    mass_k15    = agg["seq_mass_k15"]
+    mass_k30    = agg["seq_mass_k30"]
+    struct_corr = agg["struct_corr"]
+    layer_idxs  = agg["layer_indices"]
+    P, L, H     = seq_corr.shape
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    with plt.rc_context(_ACADEMIC_RC):
+
+        # ── Figure 1: seq-sep Spearman r per layer ──────────────────────
+        fig, ax = plt.subplots(figsize=(7, 4))
+        per_prot = seq_corr.mean(axis=-1)         # [P, L]
+        mu  = per_prot.mean(axis=0)
+        std = per_prot.std(axis=0)
+        ax.plot(layer_idxs, mu, color="#1565C0", lw=2)
+        ax.fill_between(layer_idxs, mu - std, mu + std, alpha=0.25, color="#1565C0")
+        ax.axhline(0, color="gray", lw=0.8, ls="--")
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Spearman r (bias vs |i−j|)")
+        ax.set_title(
+            f"Bias–sequence-separation correlation across {P} proteins (mean ± std)\n"
+            "Negative = sequential encoding"
+        )
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(f"{save_dir}/scale_seq_corr_per_layer.png",
+                        dpi=150, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 2: Toeplitz η² per layer ─────────────────────────────
+        fig, ax = plt.subplots(figsize=(7, 4))
+        per_prot = toeplitz.mean(axis=-1)
+        mu  = per_prot.mean(axis=0)
+        std = per_prot.std(axis=0)
+        ax.plot(layer_idxs, mu, color="#1B5E20", lw=2)
+        ax.fill_between(layer_idxs, mu - std, mu + std, alpha=0.25, color="#1B5E20")
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Toeplitz η²")
+        ax.set_title(
+            f"Toeplitz score across {P} proteins (mean ± std)\n"
+            "1 = matrix entirely determined by |i−j|"
+        )
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(f"{save_dir}/scale_toeplitz_per_layer.png",
+                        dpi=150, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 3: window mass per layer, three k values ─────────────
+        fig, ax = plt.subplots(figsize=(7, 4))
+        for mass_arr, k, color in [
+            (mass_k5,  5,  "#F57F17"),
+            (mass_k15, 15, "#E65100"),
+            (mass_k30, 30, "#BF360C"),
+        ]:
+            per_prot = mass_arr.mean(axis=-1)
+            mu  = per_prot.mean(axis=0)
+            std = per_prot.std(axis=0)
+            ax.plot(layer_idxs, mu, color=color, lw=2, label=f"±{k}")
+            ax.fill_between(layer_idxs, mu - std, mu + std, alpha=0.15, color=color)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Mean attention mass")
+        ax.set_title(
+            f"Attention mass within sequence window across {P} proteins (mean ± std)"
+        )
+        ax.legend(title="Window k", fontsize=9)
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(f"{save_dir}/scale_seq_mass_per_layer.png",
+                        dpi=150, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 4: structural vs sequential scatter (per head, mean over P)
+        mean_struct = struct_corr.mean(axis=0).ravel()   # [L*H]
+        mean_seq    = seq_corr.mean(axis=0).ravel()      # [L*H]  (negative = sequential)
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        sc = ax.scatter(mean_struct, mean_seq, c=mean_seq, cmap="RdBu",
+                        vmin=-0.8, vmax=0.8, alpha=0.7, s=30, edgecolors="none")
+        ax.axhline(0, color="gray", lw=0.8, ls="--")
+        ax.axvline(0, color="gray", lw=0.8, ls="--")
+        ax.set_xlabel("Mean r_struct (bias vs Cα proximity)", fontsize=10)
+        ax.set_ylabel("Mean r_seq (bias vs |i−j|)", fontsize=10)
+        ax.set_title(
+            f"Structural vs sequential encoding per head\n"
+            f"({P} proteins, {L}×{H} heads)"
+        )
+        plt.colorbar(sc, ax=ax, label="r_seq")
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(f"{save_dir}/scale_struct_vs_seq_scatter.png",
+                        dpi=150, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+        # ── Figure 5: aggregate layer×head heatmaps ─────────────────────
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(
+            f"Sequential encoding head-level means across {P} proteins", fontsize=13
+        )
+        panels = [
+            (seq_corr.mean(axis=0),   "Mean r_seq",       "RdBu_r", -1,  1),
+            (toeplitz.mean(axis=0),   "Mean Toeplitz η²", "viridis",  0,  1),
+            (mass_k15.mean(axis=0),   "Mean mass ±15",    "YlOrRd",   0,  1),
+        ]
+        for ax, (data, title, cmap, vmin, vmax) in zip(axes, panels):
+            im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax,
+                           aspect="auto", interpolation="nearest")
+            ax.set_xlabel("Head")
+            ax.set_ylabel("Layer")
+            ax.set_title(title)
+            step = max(1, L // 12)
+            ypos = list(range(0, L, step))
+            ax.set_yticks(ypos)
+            ax.set_yticklabels([str(layer_idxs[p]) for p in ypos])
+            plt.colorbar(im, ax=ax, shrink=0.85)
+        plt.tight_layout()
+        if save_dir:
+            fig.savefig(f"{save_dir}/scale_seq_head_heatmaps.png",
+                        dpi=150, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+    # ── Summary stats ─────────────────────────────────────────────────────
+    n_tot      = seq_corr.size
+    n_seq_corr = int((seq_corr < -0.3).sum())
+    n_toep     = int((toeplitz > toeplitz_threshold).sum())
+    n_mass     = int((mass_k15 > mass_threshold).sum())
+
+    print(f"\n{'='*55}")
+    print(f"Sequential encoding summary  ({P} proteins)")
+    print(f"{'='*55}")
+    print(f"  Mean seq corr r      : {seq_corr.mean():.4f} ± {seq_corr.std():.4f}")
+    print(f"  Mean Toeplitz η²     : {toeplitz.mean():.4f} ± {toeplitz.std():.4f}")
+    print(f"  Mean mass ±15        : {mass_k15.mean():.4f} ± {mass_k15.std():.4f}")
+    print(f"  Sequential heads (r_seq < -0.3): {n_seq_corr}/{n_tot}"
+          f"  ({100*n_seq_corr/n_tot:.1f}%)")
+    print(f"  Toeplitz heads (η² > {toeplitz_threshold}): {n_toep}/{n_tot}"
+          f"  ({100*n_toep/n_tot:.1f}%)")
+    print(f"  High-mass heads (±15 > {mass_threshold}): {n_mass}/{n_tot}"
+          f"  ({100*n_mass/n_tot:.1f}%)")
     print(f"{'='*55}")
 
 
